@@ -924,7 +924,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         return;
       }
 
-      const normalizedAgentId = normalizeAgentId(agentId, "exec");
+      const normalizedAgentId = normalizeAgentId(agentId);
 
       updatePersistedState<WorkspaceAISettingsByAgentCache>(
         getWorkspaceAISettingsByAgentKey(workspaceId),
@@ -1271,7 +1271,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
     const fallbackModel = defaultModel;
 
-    const normalizedAgentId = normalizeAgentId(agentId, "exec");
+    const normalizedAgentId = normalizeAgentId(agentId);
 
     const isExplicitAgentSwitch =
       prevCreationAgentIdRef.current !== null &&
