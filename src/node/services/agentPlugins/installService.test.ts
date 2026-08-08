@@ -514,6 +514,88 @@ describe("AgentPluginInstallService", () => {
     expect(await registry()).toEqual([]);
   });
 
+  test("mutations refuse a corrupted registry file instead of orphaning entries", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    // Corrupt the registry file (invalid JSON, not just an invalid entry).
+    await fsPromises.writeFile(registryFile(), "{ not json");
+
+    // Reads stay lenient: the section still renders, dirs show unmanaged.
+    const items = await service.list();
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ name: "demo-plugin", managed: false });
+
+    // Mutations refuse with a repair message — treating the corrupt file as
+    // empty would let this install rewrite it with one entry, permanently
+    // orphaning everything previously managed.
+    const remote2 = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-plugin-remote2-"));
+    try {
+      await initRemote(remote2);
+      await writePluginFixture(remote2);
+      await fsPromises.writeFile(
+        path.join(remote2, "plugin.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+          name: "other-plugin",
+          version: "1.0.0",
+        })
+      );
+      await commitAll(remote2, "init");
+      await expect(service.preview({ input: remote2 })).rejects.toThrow(/corrupted/);
+    } finally {
+      await fsPromises.rm(remote2, { recursive: true, force: true });
+    }
+    await expect(
+      service.uninstall({ name: "demo-plugin", deletePluginData: false })
+    ).rejects.toThrow(/corrupted/);
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/corrupted/);
+
+    // The corrupt file was never rewritten.
+    expect(await fsPromises.readFile(registryFile(), "utf8")).toBe("{ not json");
+  });
+
+  test("update recycles MCP servers even when the registry write fails post-promote", async () => {
+    let stops = 0;
+    const mcpStub = {
+      stopServersWithKeyPrefix: () => {
+        stops += 1;
+        return Promise.resolve();
+      },
+    } as unknown as MCPServerManager;
+    const serviceWithMcp = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      mcpServerManager: mcpStub,
+    });
+
+    const preview = await serviceWithMcp.preview({ input: remoteDir });
+    await serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await writePluginFixture(remoteDir, { version: "2.0.0" });
+    await commitAll(remoteDir, "v2");
+
+    stops = 0;
+    const internals = serviceWithMcp as unknown as {
+      writeRegistry: (entries: unknown[]) => Promise<void>;
+    };
+    const writeSpy = spyOn(internals, "writeRegistry").mockImplementationOnce(() =>
+      Promise.reject(new Error("ENOSPC: no space left on device"))
+    );
+    try {
+      await expect(serviceWithMcp.update({ name: "demo-plugin" })).rejects.toThrow(/ENOSPC/);
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    // Both recycles ran (pre-swap + post-promote) despite the failed write:
+    // the tree already swapped, so a server started from the replaced tree
+    // must not be retained.
+    expect(stops).toBe(2);
+    // Stale lockedSha keeps the badge; a retry self-heals.
+    expect(((await registry())[0] as { lockedSha: string }).lockedSha).toBe(preview.lockedSha);
+    const retried = await serviceWithMcp.update({ name: "demo-plugin" });
+    expect(retried.manifest?.version).toBe("2.0.0");
+  });
+
   test("update rejects a tracked ref whose kind changed on the remote", async () => {
     await git(remoteDir, "branch", "track");
     const preview = await service.preview({ input: remoteDir, ref: "track" });

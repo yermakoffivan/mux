@@ -173,8 +173,14 @@ export class AgentPluginInstallService {
    * verbatim, so entries/fields written by newer builds — future source
    * kinds, extra registry fields — survive an install/update/uninstall on
    * this build (upgrade↔downgrade stays lossless).
+   *
+   * A missing file is an empty registry; UNPARSEABLE content is not. Reads
+   * ("lenient") degrade it to [] so the section still renders (dirs show as
+   * unmanaged), but mutations ("strict") must refuse: treating a corrupted
+   * file as empty would let the next install rewrite it with a single entry,
+   * permanently orphaning every previously managed install.
    */
-  private async readRegistryRaw(): Promise<unknown[]> {
+  private async readRegistryRaw(mode: "lenient" | "strict"): Promise<unknown[]> {
     let raw: string;
     try {
       raw = await fsPromises.readFile(this.registryFile, "utf8");
@@ -186,6 +192,11 @@ export class AgentPluginInstallService {
     try {
       parsedJson = JSON.parse(raw);
     } catch (error) {
+      if (mode === "strict") {
+        throw new Error(
+          `The plugin registry (${shortenHome(this.registryFile)}) is corrupted and cannot be parsed: ${getErrorMessage(error)}. Repair or remove the file, then retry.`
+        );
+      }
       log.warn("Ignoring unparseable plugin registry file", {
         file: this.registryFile,
         error: getErrorMessage(error),
@@ -223,8 +234,8 @@ export class AgentPluginInstallService {
     return entries;
   }
 
-  private async readRegistry(): Promise<AgentPluginInstallEntry[]> {
-    return this.parseRegistryEntries(await this.readRegistryRaw());
+  private async readRegistry(mode: "lenient" | "strict"): Promise<AgentPluginInstallEntry[]> {
+    return this.parseRegistryEntries(await this.readRegistryRaw(mode));
   }
 
   /** `name` of a raw registry entry, for identity matching during raw rewrites. */
@@ -688,7 +699,9 @@ export class AgentPluginInstallService {
   }
 
   private async assertNoCollision(name: string): Promise<void> {
-    const registry = await this.readRegistry();
+    // Strict: a corrupted registry must fail installs up front (with the
+    // repair message) instead of letting a later strict read fail mid-flow.
+    const registry = await this.readRegistry("strict");
     if (registry.some((entry) => entry.name === name)) {
       throw new Error(`A managed plugin named '${name}' is already installed. Uninstall it first.`);
     }
@@ -741,7 +754,7 @@ export class AgentPluginInstallService {
           },
         };
         try {
-          const rawRegistry = await this.readRegistryRaw();
+          const rawRegistry = await this.readRegistryRaw("strict");
           await this.writeRegistry([
             ...rawRegistry.filter((rawEntry) => this.rawEntryName(rawEntry) !== name),
             entry,
@@ -764,7 +777,7 @@ export class AgentPluginInstallService {
   async list(): Promise<AgentPluginListItem[]> {
     this.assertEnabled();
 
-    const registry = await this.readRegistry();
+    const registry = await this.readRegistry("lenient");
     const containers: AgentPluginContainer[] = [
       { path: this.containerDir, scope: "global" },
       { path: path.join(os.homedir(), ".agents", "plugins"), scope: "global" },
@@ -859,7 +872,7 @@ export class AgentPluginInstallService {
     this.assertEnabled();
 
     return this.runExclusive(async () => {
-      const rawRegistry = await this.readRegistryRaw();
+      const rawRegistry = await this.readRegistryRaw("strict");
       const registry = this.parseRegistryEntries(rawRegistry);
       const entry = registry.find((e) => e.name === args.name);
       if (!entry) {
@@ -1031,7 +1044,7 @@ export class AgentPluginInstallService {
   async checkUpdates(): Promise<AgentPluginUpdateCheck[]> {
     this.assertEnabled();
 
-    const registry = await this.readRegistry();
+    const registry = await this.readRegistry("lenient");
     return Promise.all(
       registry.map(async (entry): Promise<AgentPluginUpdateCheck> => {
         if (entry.source.refType === "commit") {
@@ -1073,7 +1086,7 @@ export class AgentPluginInstallService {
     this.assertEnabled();
 
     return this.runExclusive(async () => {
-      const rawRegistry = await this.readRegistryRaw();
+      const rawRegistry = await this.readRegistryRaw("strict");
       const registry = this.parseRegistryEntries(rawRegistry);
       const entry = registry.find((e) => e.name === args.name);
       if (!entry) {
@@ -1171,42 +1184,47 @@ export class AgentPluginInstallService {
         // the Zod-parsed entry would replace `source`/`manifest` wholesale
         // with their stripped counterparts, deleting nested metadata a newer
         // build may have stored there (breaking downgrade round-trips).
-        await this.writeRegistry(
-          rawRegistry.map((rawEntry) => {
-            if (this.rawEntryName(rawEntry) !== entry.name) {
-              return rawEntry;
-            }
-            const rawRecord = rawEntry as Record<string, unknown>;
-            const rawManifest =
-              typeof rawRecord.manifest === "object" &&
-              rawRecord.manifest !== null &&
-              !Array.isArray(rawRecord.manifest)
-                ? (rawRecord.manifest as Record<string, unknown>)
-                : {};
-            // version/description are owned by the update (they mirror the
-            // newly installed plugin.json), so stale values are dropped and
-            // fresh ones written; unknown manifest keys pass through.
-            const {
-              version: _staleVersion,
-              description: _staleDescription,
-              ...preservedManifest
-            } = rawManifest;
-            return {
-              ...rawRecord,
-              lockedSha: updated.lockedSha,
-              updatedAt: updated.updatedAt,
-              manifest: { ...preservedManifest, ...updated.manifest },
-            };
-          })
-        );
-
-        // Recycle again post-promote: content changed behind a stable path
-        // (and possibly an unchanged stdio command line), which the config
-        // signature cannot see — and a concurrent stream may have relaunched
-        // servers against the old tree between the pre-swap stop and now.
-        // Servers restart on next use; default-disabled state and workspace
-        // overrides are untouched (identity is the lexical path).
-        await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
+        try {
+          await this.writeRegistry(
+            rawRegistry.map((rawEntry) => {
+              if (this.rawEntryName(rawEntry) !== entry.name) {
+                return rawEntry;
+              }
+              const rawRecord = rawEntry as Record<string, unknown>;
+              const rawManifest =
+                typeof rawRecord.manifest === "object" &&
+                rawRecord.manifest !== null &&
+                !Array.isArray(rawRecord.manifest)
+                  ? (rawRecord.manifest as Record<string, unknown>)
+                  : {};
+              // version/description are owned by the update (they mirror the
+              // newly installed plugin.json), so stale values are dropped and
+              // fresh ones written; unknown manifest keys pass through.
+              const {
+                version: _staleVersion,
+                description: _staleDescription,
+                ...preservedManifest
+              } = rawManifest;
+              return {
+                ...rawRecord,
+                lockedSha: updated.lockedSha,
+                updatedAt: updated.updatedAt,
+                manifest: { ...preservedManifest, ...updated.manifest },
+              };
+            })
+          );
+        } finally {
+          // Recycle post-promote even when the registry write fails: the tree
+          // already swapped, so (1) content changed behind a stable path —
+          // possibly an unchanged stdio command line — which the config
+          // signature cannot see, and (2) a concurrent getToolsForWorkspace
+          // that began after the pre-swap invalidation but discovered the
+          // plugin before the rename may have published a server from the
+          // replaced tree. Servers restart on next use; default-disabled
+          // state and workspace overrides are untouched (identity is the
+          // lexical path).
+          await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
+        }
 
         log.info(
           `Updated agent plugin '${entry.name}' ${entry.lockedSha.slice(0, 12)} → ${resolved.sha.slice(0, 12)}`
