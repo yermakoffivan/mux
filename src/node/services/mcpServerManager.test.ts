@@ -121,7 +121,7 @@ describe("MCPServerManager", () => {
     manager.dispose();
   });
 
-  test("stopServersWithKeyPrefix invalidates instances published by an in-flight startup", async () => {
+  test("stopServersWithKeyPrefix invalidates instances published by an in-flight startup, then retries them", async () => {
     const workspaceId = "ws-swap-race";
     const pluginKey = "plugin:abc123:echo";
     configService.listServers.mockImplementation(() =>
@@ -156,20 +156,76 @@ describe("MCPServerManager", () => {
     expect(Object.keys(result.tools)).toEqual([]);
     const entry = access.workspaceServers.get(workspaceId) as {
       instances: Map<string, unknown>;
+      timedOutServerNames: string[];
     };
     expect(entry.instances.size).toBe(0);
 
-    // Startups that BEGIN after the invalidation are unaffected.
+    // The entry was published under the UNCHANGED config signature, so the
+    // next call hits the cached path — the removed server must carry a retry
+    // marker there, or the updated plugin's tools stay unavailable forever.
+    expect(entry.timedOutServerNames).toContain(pluginKey);
+    const echoTool = testTool();
     const close2 = mock(() => Promise.resolve(undefined));
-    access.startServers = () => Promise.resolve(startResult([[pluginKey, { close: close2 }]]));
-    access.workspaceServers.delete(workspaceId);
+    access.startServers = () =>
+      Promise.resolve(startResult([[pluginKey, { tools: { echo: echoTool }, close: close2 }]]));
+
     const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    // Restarted from the (new) tree via the retry path — not served from the
+    // reduced cached map, and not torn down again.
     expect(close2).toHaveBeenCalledTimes(0);
-    expect(Object.keys(second.tools).length).toBeGreaterThanOrEqual(0);
+    expect(Object.keys(second.tools)).toHaveLength(1);
     const secondEntry = access.workspaceServers.get(workspaceId) as {
       instances: Map<string, unknown>;
+      timedOutServerNames: string[];
     };
     expect(secondEntry.instances.size).toBe(1);
+    expect(secondEntry.timedOutServerNames).toEqual([]);
+  });
+
+  test("stopServersWithKeyPrefix closes only matching instances and retries them on next use", async () => {
+    const workspaceId = "ws-selective-stop";
+    const pluginKey = "plugin:abc123:echo";
+    const userServer = "user-server";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({
+        [pluginKey]: stdioConfig("node server.js"),
+        [userServer]: stdioConfig("npx user-server"),
+      })
+    );
+
+    const pluginClose = mock(() => Promise.resolve(undefined));
+    const userClose = mock(() => Promise.resolve(undefined));
+    const userTool = testTool();
+    access.startServers = () =>
+      Promise.resolve(
+        startResult([
+          [pluginKey, { close: pluginClose }],
+          [userServer, { tools: { toolu: userTool }, close: userClose }],
+        ])
+      );
+
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    // Simulate a live agent stream holding the workspace's servers.
+    manager.acquireLease(workspaceId);
+    try {
+      await manager.stopServersWithKeyPrefix("plugin:abc123:");
+
+      // Only the plugin instance was closed; the unrelated healthy client
+      // survives underneath the live lease.
+      expect(pluginClose).toHaveBeenCalledTimes(1);
+      expect(userClose).toHaveBeenCalledTimes(0);
+      const entry = access.workspaceServers.get(workspaceId) as {
+        instances: Map<string, unknown>;
+        timedOutServerNames: string[];
+      };
+      expect(entry.instances.has(userServer)).toBe(true);
+      expect(entry.instances.has(pluginKey)).toBe(false);
+      // The stopped plugin server is queued for restart on next use.
+      expect(entry.timedOutServerNames).toContain(pluginKey);
+    } finally {
+      manager.releaseLease(workspaceId);
+    }
   });
 
   test("cleanupIdleServers stops idle servers when workspace is not leased", () => {
