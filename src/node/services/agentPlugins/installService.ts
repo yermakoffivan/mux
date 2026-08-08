@@ -873,12 +873,14 @@ export class AgentPluginInstallService {
       // Stop running servers before deleting the tree out from under them.
       await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
 
-      // Stage the tree out of the container BEFORE touching the registry so
-      // either step can fail without partial state: a failed rename (e.g. a
-      // locked file on Windows) leaves the install fully intact, and a failed
-      // registry write renames the tree back. Deleting the staged tree is
-      // best-effort — it sits under the staging root, where stale-dir
-      // reclamation cleans up leftovers.
+      // Stage the tree — and, when requested, the plugin-data dir — out
+      // BEFORE touching the registry so every step can fail without partial
+      // state: a failed rename (e.g. a locked file on Windows) leaves the
+      // install fully intact, and a failed registry write renames everything
+      // back. Deleting the staged dirs afterwards is best-effort — they sit
+      // under the staging root, where stale-dir reclamation cleans up
+      // leftovers, so a locked dir cannot strand the user in a state where
+      // the Settings row is gone but their requested cleanup never happens.
       await fsPromises.mkdir(this.stagingRoot, { recursive: true });
       const trashDir = path.join(this.stagingRoot, `trash-${Date.now()}-${entry.name}`);
       let stagedTree = false;
@@ -892,26 +894,56 @@ export class AgentPluginInstallService {
         // Missing tree (present:false row): registry-only uninstall.
       }
 
+      const restoreTree = async (context: string): Promise<void> => {
+        if (!stagedTree) {
+          return;
+        }
+        await fsPromises.rename(trashDir, targetPath).catch((rollbackError: unknown) => {
+          log.error(`Failed to restore plugin dir after ${context}`, {
+            targetPath,
+            rollbackError,
+          });
+        });
+      };
+
+      const dataPath = getPluginDataPath(this.config.rootDir, instanceId);
+      const dataTrashDir = path.join(this.stagingRoot, `trash-data-${Date.now()}-${entry.name}`);
+      let stagedData = false;
+      if (args.deletePluginData) {
+        try {
+          await fsPromises.rename(dataPath, dataTrashDir);
+          stagedData = true;
+        } catch (error) {
+          if (!hasErrorCode(error, "ENOENT")) {
+            // Fail BEFORE the registry commit so the row stays and the user
+            // can retry the requested cleanup.
+            await restoreTree("failed plugin-data staging");
+            throw new Error(`Failed to remove the plugin data: ${getErrorMessage(error)}`);
+          }
+          // No data dir: nothing to delete.
+        }
+      }
+
       try {
         await this.writeRegistry(
           rawRegistry.filter((rawEntry) => this.rawEntryName(rawEntry) !== entry.name)
         );
       } catch (error) {
-        if (stagedTree) {
-          await fsPromises.rename(trashDir, targetPath).catch((rollbackError: unknown) => {
-            log.error("Failed to restore plugin dir after failed registry write", {
-              targetPath,
+        await restoreTree("failed registry write");
+        if (stagedData) {
+          await fsPromises.rename(dataTrashDir, dataPath).catch((rollbackError: unknown) => {
+            log.error("Failed to restore plugin data after failed registry write", {
+              dataPath,
               rollbackError,
             });
           });
         }
         throw new Error(`Failed to persist the plugin registry: ${getErrorMessage(error)}`);
       }
+
+      // The uninstall is committed; everything below is best-effort cleanup
+      // that must not abort the remaining steps.
       if (stagedTree) {
-        // Best-effort, as documented above: a locked staged tree must not
-        // abort the remaining uninstall steps (override pruning below keeps
-        // reinstall from silently re-enabling servers via the same instance
-        // ID). Leftovers are reclaimed by purgeStaleStaging.
         await this.removeDir(trashDir).catch((error: unknown) => {
           log.warn("Failed to delete uninstalled plugin tree; leaving it for staging reclamation", {
             trashDir,
@@ -919,12 +951,24 @@ export class AgentPluginInstallService {
           });
         });
       }
+      if (stagedData) {
+        await this.removeDir(dataTrashDir).catch((error: unknown) => {
+          log.warn("Failed to delete plugin data; leaving it for staging reclamation", {
+            dataTrashDir,
+            error: getErrorMessage(error),
+          });
+        });
+      }
 
       await this.pruneWorkspaceOverrides(serverKeyPrefix);
 
-      if (args.deletePluginData) {
-        await this.removeDir(getPluginDataPath(this.config.rootDir, instanceId));
-      }
+      // Re-invalidate AFTER the tree is gone: a getToolsForWorkspace call
+      // that started right after the pre-rename stop snapshots the new epoch,
+      // and can still have discovered the plugin before the rename — its
+      // freshly started server would otherwise publish validly and keep
+      // running from the removed tree.
+      await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
+
       log.info(`Uninstalled agent plugin '${entry.name}'`);
     });
   }
@@ -1120,14 +1164,40 @@ export class AgentPluginInstallService {
         };
         // The new tree is already promoted; a failed write surfaces as an
         // error and the stale lockedSha keeps the update badge visible, so
-        // retrying the update self-heals the mismatch. Merging over the raw
-        // entry preserves fields a newer build may have added to it.
+        // retrying the update self-heals the mismatch.
+        //
+        // Patch ONLY the fields this update owns (lockedSha, updatedAt, and
+        // the manifest's version/description) into the RAW entry: spreading
+        // the Zod-parsed entry would replace `source`/`manifest` wholesale
+        // with their stripped counterparts, deleting nested metadata a newer
+        // build may have stored there (breaking downgrade round-trips).
         await this.writeRegistry(
-          rawRegistry.map((rawEntry) =>
-            this.rawEntryName(rawEntry) === entry.name
-              ? { ...(rawEntry as Record<string, unknown>), ...updated }
-              : rawEntry
-          )
+          rawRegistry.map((rawEntry) => {
+            if (this.rawEntryName(rawEntry) !== entry.name) {
+              return rawEntry;
+            }
+            const rawRecord = rawEntry as Record<string, unknown>;
+            const rawManifest =
+              typeof rawRecord.manifest === "object" &&
+              rawRecord.manifest !== null &&
+              !Array.isArray(rawRecord.manifest)
+                ? (rawRecord.manifest as Record<string, unknown>)
+                : {};
+            // version/description are owned by the update (they mirror the
+            // newly installed plugin.json), so stale values are dropped and
+            // fresh ones written; unknown manifest keys pass through.
+            const {
+              version: _staleVersion,
+              description: _staleDescription,
+              ...preservedManifest
+            } = rawManifest;
+            return {
+              ...rawRecord,
+              lockedSha: updated.lockedSha,
+              updatedAt: updated.updatedAt,
+              manifest: { ...preservedManifest, ...updated.manifest },
+            };
+          })
         );
 
         // Recycle again post-promote: content changed behind a stable path

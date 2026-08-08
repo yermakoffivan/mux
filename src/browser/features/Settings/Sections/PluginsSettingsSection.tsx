@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ArrowDownToLine,
   ArrowLeft,
@@ -29,7 +29,7 @@ import {
 /**
  * Settings → Plugins (agent-plugins experiment; global scope only).
  *
- * Managed installs come from the `plugins` registry in ~/.mux/config.json;
+ * Managed installs come from the `~/.mux/plugins.json` registry;
  * unmanaged plugin directories found by discovery are listed read-only.
  * Update checks run on section open and on the explicit button only — no
  * background timers, and updates never auto-apply.
@@ -77,7 +77,7 @@ const AddPluginPanel: React.FC<{
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<AgentPluginInstallPreview | null>(null);
 
-  const handlePreview = useCallback(async () => {
+  const handlePreview = async () => {
     if (!api || input.trim().length === 0 || busy) return;
     setBusy(true);
     setError(null);
@@ -96,9 +96,9 @@ const AddPluginPanel: React.FC<{
     } finally {
       setBusy(false);
     }
-  }, [api, input, ref, busy]);
+  };
 
-  const handleInstall = useCallback(async () => {
+  const handleInstall = async () => {
     if (!api || !preview || busy) return;
     setBusy(true);
     setError(null);
@@ -117,7 +117,7 @@ const AddPluginPanel: React.FC<{
     } finally {
       setBusy(false);
     }
-  }, [api, preview, busy, props]);
+  };
 
   return (
     <div className="border-border-medium bg-background-secondary space-y-3 rounded-md border p-3">
@@ -354,8 +354,10 @@ export const PluginsSettingsSection: React.FC = () => {
   );
   /** Name of the plugin with an update/uninstall in flight. */
   const [busyPlugin, setBusyPlugin] = useState<string | null>(null);
+  /** Monotonic id of the latest update check; stale responses must not commit state. */
+  const checkGenerationRef = useRef(0);
 
-  const refresh = useCallback(async () => {
+  const refresh = async () => {
     if (!api) return;
     try {
       const result = await api.agentPlugins.list();
@@ -370,13 +372,20 @@ export const PluginsSettingsSection: React.FC = () => {
       setItems([]);
       setError(getErrorMessage(err));
     }
-  }, [api]);
+  };
 
-  const checkForUpdates = useCallback(async () => {
+  const checkForUpdates = async () => {
     if (!api) return;
+    // Overlapping checks race (mount-time check vs a refresh published by a
+    // palette update): only the latest request may commit state, or a stale
+    // response can resurrect an update badge the update just cleared.
+    const generation = ++checkGenerationRef.current;
     setCheckingUpdates(true);
     try {
       const result = await api.agentPlugins.checkUpdates();
+      if (generation !== checkGenerationRef.current) {
+        return; // A newer check superseded this one.
+      }
       if (result.success) {
         setUpdateChecks(new Map(result.data.map((check) => [check.name, check])));
         setUpdateCheckError(null);
@@ -384,17 +393,22 @@ export const PluginsSettingsSection: React.FC = () => {
         setUpdateCheckError(result.error);
       }
     } catch (err) {
-      setUpdateCheckError(getErrorMessage(err));
+      if (generation === checkGenerationRef.current) {
+        setUpdateCheckError(getErrorMessage(err));
+      }
     } finally {
-      setCheckingUpdates(false);
+      if (generation === checkGenerationRef.current) {
+        setCheckingUpdates(false);
+      }
     }
-  }, [api]);
+  };
 
   // Approved update policy: passive check on section open + explicit button only.
   useEffect(() => {
     void refresh();
     void checkForUpdates();
-  }, [refresh, checkForUpdates]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- fetch on mount / API reconnect only; refresh/checkForUpdates are plain handlers (compiler-memoized), not inputs
+  }, [api]);
 
   // Live palette intents while mounted (see pluginsSectionIntents).
   useEffect(() => {
@@ -412,57 +426,52 @@ export const PluginsSettingsSection: React.FC = () => {
           break;
       }
     });
-  }, [refresh, checkForUpdates]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- resubscribe on API reconnect only; the listener reads the latest handlers via closure per subscription
+  }, [api]);
 
-  const handleUpdate = useCallback(
-    async (name: string) => {
-      if (!api || busyPlugin !== null) return;
-      setBusyPlugin(name);
-      setError(null);
-      try {
-        const result = await api.agentPlugins.update({ name });
-        // Refresh regardless of outcome (the swap may be partially visible),
-        // but re-assert the mutation error AFTER the refresh: refresh's
-        // success path clears the error state, which would silently swallow
-        // the failure the user needs to see.
+  const handleUpdate = async (name: string) => {
+    if (!api || busyPlugin !== null) return;
+    setBusyPlugin(name);
+    setError(null);
+    try {
+      const result = await api.agentPlugins.update({ name });
+      // Refresh regardless of outcome (the swap may be partially visible),
+      // but re-assert the mutation error AFTER the refresh: refresh's
+      // success path clears the error state, which would silently swallow
+      // the failure the user needs to see.
+      await refresh();
+      await checkForUpdates();
+      if (!result.success) {
+        setError(result.error);
+      }
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setBusyPlugin(null);
+    }
+  };
+
+  const handleUninstall = async (name: string, deletePluginData: boolean) => {
+    if (!api || busyPlugin !== null) return;
+    setBusyPlugin(name);
+    setError(null);
+    try {
+      const result = await api.agentPlugins.uninstall({ name, deletePluginData });
+      if (result.success) {
+        setUninstallTarget(null);
         await refresh();
-        await checkForUpdates();
-        if (!result.success) {
-          setError(result.error);
-        }
-      } catch (err) {
-        setError(getErrorMessage(err));
-      } finally {
-        setBusyPlugin(null);
+      } else {
+        // Keep the confirmation open and surface the error after the list
+        // refresh (whose success path clears error state).
+        await refresh();
+        setError(result.error);
       }
-    },
-    [api, busyPlugin, refresh, checkForUpdates]
-  );
-
-  const handleUninstall = useCallback(
-    async (name: string, deletePluginData: boolean) => {
-      if (!api || busyPlugin !== null) return;
-      setBusyPlugin(name);
-      setError(null);
-      try {
-        const result = await api.agentPlugins.uninstall({ name, deletePluginData });
-        if (result.success) {
-          setUninstallTarget(null);
-          await refresh();
-        } else {
-          // Keep the confirmation open and surface the error after the list
-          // refresh (whose success path clears error state).
-          await refresh();
-          setError(result.error);
-        }
-      } catch (err) {
-        setError(getErrorMessage(err));
-      } finally {
-        setBusyPlugin(null);
-      }
-    },
-    [api, busyPlugin, refresh]
-  );
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setBusyPlugin(null);
+    }
+  };
 
   return (
     <div className="space-y-6">

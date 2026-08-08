@@ -297,6 +297,61 @@ describe("AgentPluginInstallService", () => {
     expect(entry.name).toBe("demo-plugin");
   });
 
+  test("uninstall re-invalidates MCP servers after the tree is removed", async () => {
+    // A getToolsForWorkspace that starts right after the pre-rename stop can
+    // discover the plugin before the rename and start a server from the
+    // removed tree; the post-removal invalidation must catch it. Snapshot
+    // the tree state at each recycle: first stop sees the tree, second stop
+    // must run after it is gone.
+    const treeStates: boolean[] = [];
+    const mcpStub = {
+      stopServersWithKeyPrefix: async () => {
+        treeStates.push(await pathExists(path.join(pluginsDir(), "demo-plugin")));
+      },
+    } as unknown as MCPServerManager;
+    const serviceWithMcp = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      mcpServerManager: mcpStub,
+    });
+
+    const preview = await serviceWithMcp.preview({ input: remoteDir });
+    await serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await serviceWithMcp.uninstall({ name: "demo-plugin", deletePluginData: false });
+
+    expect(treeStates).toEqual([true, false]);
+  });
+
+  test("uninstall stages plugin-data before committing when deletion is requested", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
+    const dataPath = getPluginDataPath(muxRoot, instanceId);
+    await fsPromises.mkdir(dataPath, { recursive: true });
+    await fsPromises.writeFile(path.join(dataPath, "state.json"), "{}");
+
+    // Make the data dir unstageable: rename mutates the parent (plugin-data/).
+    await fsPromises.chmod(path.join(muxRoot, "plugin-data"), 0o555);
+    try {
+      await expect(
+        service.uninstall({ name: "demo-plugin", deletePluginData: true })
+      ).rejects.toThrow(/Failed to remove the plugin data/);
+    } finally {
+      await fsPromises.chmod(path.join(muxRoot, "plugin-data"), 0o755);
+    }
+
+    // The uninstall did not commit: the Settings row survives so the user can
+    // retry the requested cleanup, and nothing was half-removed.
+    expect(await registry()).toHaveLength(1);
+    expect(await pathExists(path.join(pluginsDir(), "demo-plugin", "plugin.json"))).toBe(true);
+    expect(await pathExists(path.join(dataPath, "state.json"))).toBe(true);
+
+    // Retry succeeds and honors the data-deletion request.
+    await service.uninstall({ name: "demo-plugin", deletePluginData: true });
+    expect(await registry()).toEqual([]);
+    expect(await pathExists(dataPath)).toBe(false);
+  });
+
   test("uninstall preserves plugin-data by default and deletes it when asked", async () => {
     const preview = await service.preview({ input: remoteDir });
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
@@ -400,6 +455,41 @@ describe("AgentPluginInstallService", () => {
     expect(await registry()).toEqual([futureEntry]);
     // And it never surfaced as a managed row this build could mutate.
     expect((await service.list()).map((item) => item.name)).not.toContain("future-plugin");
+  });
+
+  test("update preserves unknown nested fields inside the entry's source and manifest", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    // A newer build stored extra metadata INSIDE the git source and manifest
+    // of this entry; a shallow merge of the Zod-parsed entry would strip it.
+    const onDisk = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    (onDisk.plugins[0].source as Record<string, unknown>).integrity = "sha256-future";
+    onDisk.plugins[0].manifest = {
+      ...(onDisk.plugins[0].manifest as Record<string, unknown>),
+      icon: "sparkles",
+    };
+    await fsPromises.writeFile(registryFile(), JSON.stringify(onDisk));
+
+    await writePluginFixture(remoteDir, { version: "2.0.0" });
+    const newHead = await commitAll(remoteDir, "v2");
+    await service.update({ name: "demo-plugin" });
+
+    const after = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{
+        lockedSha: string;
+        source: Record<string, unknown>;
+        manifest: Record<string, unknown>;
+      }>;
+    };
+    expect(after.plugins[0].lockedSha).toBe(newHead);
+    // Owned fields updated…
+    expect(after.plugins[0].manifest.version).toBe("2.0.0");
+    // …unknown nested metadata untouched.
+    expect(after.plugins[0].source.integrity).toBe("sha256-future");
+    expect(after.plugins[0].manifest.icon).toBe("sparkles");
   });
 
   test("managed list rows keep registry identity when the manifest name drifts", async () => {
