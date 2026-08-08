@@ -77,6 +77,12 @@ describe("parseAgentPluginSourceInput", () => {
     expect(parseAgentPluginSourceInput("~/plugins/demo").url).toBe(
       path.join(os.homedir(), "plugins/demo")
     );
+    expect(parseAgentPluginSourceInput("~").url).toBe(os.homedir());
+    // Windows-native separator: `~\plugins\demo` must expand too, not reach
+    // git as a literal tilde.
+    expect(parseAgentPluginSourceInput("~\\plugins\\demo").url).toBe(
+      path.join(os.homedir(), "plugins\\demo")
+    );
   });
 
   test("rejects unusable inputs with actionable messages", () => {

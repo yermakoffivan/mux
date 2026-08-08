@@ -1650,26 +1650,32 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                   (check) => check.status === "update-available" || check.status === "tag-moved"
                 );
                 // Per-plugin failures ride inside a successful result; an
-                // unreachable remote is an unknown state, not "up to date".
+                // unreachable remote is an unknown state, not "up to date" —
+                // and it stays in the summary even when updates were found.
                 const failed = result.data.filter((check) => check.status === "error");
+                const summary: string[] = [];
                 if (updatable.length > 0) {
-                  showCommandFeedbackToast({
-                    type: "success",
-                    message: `Updates available: ${updatable.map((check) => check.name).join(", ")}`,
-                  });
-                  openSettings("plugins");
-                } else if (failed.length > 0) {
-                  showCommandFeedbackToast({
-                    type: "error",
-                    message: `Update check failed for ${failed.map((check) => check.name).join(", ")}`,
-                  });
-                  openSettings("plugins");
-                } else {
+                  summary.push(
+                    `Updates available: ${updatable.map((check) => check.name).join(", ")}`
+                  );
+                }
+                if (failed.length > 0) {
+                  summary.push(
+                    `Update check failed for ${failed.map((check) => check.name).join(", ")}`
+                  );
+                }
+                if (summary.length === 0) {
                   showCommandFeedbackToast({
                     type: "success",
                     message: "All plugins are up to date.",
                   });
+                  return;
                 }
+                showCommandFeedbackToast({
+                  type: failed.length > 0 ? "error" : "success",
+                  message: summary.join(". "),
+                });
+                openSettings("plugins");
               },
             },
             {
@@ -1692,13 +1698,16 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 const updatable = checks.data.filter(
                   (check) => check.status === "update-available"
                 );
+                // Unreachable remotes are an unknown state, never "up to date" —
+                // and they must stay visible even when other updates succeed.
+                const checkFailures = checks.data
+                  .filter((check) => check.status === "error")
+                  .map((check) => check.name);
                 if (updatable.length === 0) {
-                  const failed = checks.data.filter((check) => check.status === "error");
-                  if (failed.length > 0) {
-                    // An unreachable remote is an unknown state, not "up to date".
+                  if (checkFailures.length > 0) {
                     showCommandFeedbackToast({
                       type: "error",
-                      message: `Update check failed for ${failed.map((check) => check.name).join(", ")}`,
+                      message: `Update check failed for ${checkFailures.join(", ")}`,
                     });
                   } else {
                     showCommandFeedbackToast({
@@ -1708,24 +1717,36 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                   }
                   return;
                 }
-                const failures: string[] = [];
+                const updateFailures: string[] = [];
+                const updatedNames: string[] = [];
                 for (const check of updatable) {
                   const result = await api.agentPlugins.update({ name: check.name });
-                  if (!result.success) {
-                    failures.push(`${check.name}: ${result.error}`);
+                  if (result.success) {
+                    updatedNames.push(check.name);
+                  } else {
+                    updateFailures.push(`${check.name}: ${result.error}`);
                   }
                 }
                 // A mounted section only re-queries from its own handlers, so
                 // tell it the backend state changed under it.
                 publishPluginsSectionIntent({ type: "refresh" });
-                if (failures.length > 0) {
-                  showCommandFeedbackToast({ type: "error", message: failures.join("; ") });
-                } else {
-                  showCommandFeedbackToast({
-                    type: "success",
-                    message: `Updated ${updatable.map((check) => check.name).join(", ")}`,
-                  });
+
+                const summary: string[] = [];
+                if (updatedNames.length > 0) {
+                  summary.push(`Updated ${updatedNames.join(", ")}`);
                 }
+                if (updateFailures.length > 0) {
+                  summary.push(`Update failed — ${updateFailures.join("; ")}`);
+                }
+                if (checkFailures.length > 0) {
+                  summary.push(`Update check failed for ${checkFailures.join(", ")}`);
+                }
+                showCommandFeedbackToast({
+                  // Any failure taints the toast: a partial success must not
+                  // read as a verified all-clear.
+                  type: updateFailures.length > 0 || checkFailures.length > 0 ? "error" : "success",
+                  message: summary.join(". "),
+                });
               },
             },
           ] satisfies CommandAction[])

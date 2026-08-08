@@ -1,10 +1,11 @@
 /* eslint-disable @typescript-eslint/await-thenable -- bun:test types `await expect(...).rejects.toThrow()` as void */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
 import { Config } from "@/node/config";
+import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { AgentPluginInstallService } from "./installService";
 import {
@@ -227,6 +228,73 @@ describe("AgentPluginInstallService", () => {
     await service.install({ source: shaPreview.source, expectedSha: firstSha });
     expect(await service.checkUpdates()).toEqual([{ name: "demo-plugin", status: "pinned" }]);
     await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/pinned/);
+  });
+
+  test("update stops the plugin's MCP servers before the old tree moves", async () => {
+    // Snapshot which tree is installed at each recycle: the pre-swap stop
+    // must observe the OLD tree still intact (a live server losing its files
+    // mid-swap on POSIX / holding locks on Windows is the failure mode).
+    const observedVersions: Array<string | null> = [];
+    const mcpStub = {
+      stopServersWithKeyPrefix: async () => {
+        try {
+          const manifest = JSON.parse(
+            await fsPromises.readFile(path.join(pluginsDir(), "demo-plugin", "plugin.json"), "utf8")
+          ) as { version: string };
+          observedVersions.push(manifest.version);
+        } catch {
+          observedVersions.push(null);
+        }
+      },
+    } as unknown as MCPServerManager;
+    const serviceWithMcp = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      mcpServerManager: mcpStub,
+    });
+
+    const preview = await serviceWithMcp.preview({ input: remoteDir });
+    await serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await writePluginFixture(remoteDir, { version: "2.0.0" });
+    await commitAll(remoteDir, "v2");
+
+    await serviceWithMcp.update({ name: "demo-plugin" });
+
+    // Two recycles: pre-swap (old tree, servers stopped while their files
+    // still exist) and post-promote (new content behind the stable path).
+    expect(observedVersions.length).toBe(2);
+    expect(observedVersions[0]).toBe("1.0.0");
+    expect(observedVersions[1]).toBe("2.0.0");
+  });
+
+  test("uninstall completes even when deleting the staged tree fails", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    // Force the best-effort trash deletion to fail (e.g. a Windows file
+    // lock). It must not abort uninstall before override pruning runs.
+    const internals = service as unknown as { removeDir: (dir: string) => Promise<void> };
+    const removeDirSpy = spyOn(internals, "removeDir").mockImplementationOnce(() =>
+      Promise.reject(new Error("EBUSY: resource busy or locked"))
+    );
+    try {
+      await service.uninstall({ name: "demo-plugin", deletePluginData: false });
+    } finally {
+      removeDirSpy.mockRestore();
+    }
+
+    // Uninstall completed: registry entry + container dir gone; the staged
+    // tree remains under staging for stale-dir reclamation.
+    expect(await registry()).toEqual([]);
+    expect(await pathExists(path.join(pluginsDir(), "demo-plugin"))).toBe(false);
+    expect((await stagingLeftovers()).some((name) => name.startsWith("trash-"))).toBe(true);
+
+    // And reinstall is not blocked by leftover state.
+    const preview2 = await service.preview({ input: remoteDir });
+    const entry = await service.install({
+      source: preview2.source,
+      expectedSha: preview2.lockedSha,
+    });
+    expect(entry.name).toBe("demo-plugin");
   });
 
   test("uninstall preserves plugin-data by default and deletes it when asked", async () => {

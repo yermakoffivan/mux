@@ -332,7 +332,12 @@ const UninstallConfirm: React.FC<{
 export const PluginsSettingsSection: React.FC = () => {
   const { api } = useAPI();
   const [items, setItems] = useState<AgentPluginListItem[] | null>(null);
+  // List/mutation errors and update-check errors live in separate state: the
+  // mount-time list query and update check run concurrently, and a later
+  // refresh success must not clear a check failure (an unreachable remote has
+  // to stay visibly unknown, never silently "up to date").
   const [error, setError] = useState<string | null>(null);
+  const [updateCheckError, setUpdateCheckError] = useState<string | null>(null);
   const [updateChecks, setUpdateChecks] = useState<Map<string, AgentPluginUpdateCheck>>(
     () => new Map()
   );
@@ -374,11 +379,12 @@ export const PluginsSettingsSection: React.FC = () => {
       const result = await api.agentPlugins.checkUpdates();
       if (result.success) {
         setUpdateChecks(new Map(result.data.map((check) => [check.name, check])));
+        setUpdateCheckError(null);
       } else {
-        setError(result.error);
+        setUpdateCheckError(result.error);
       }
     } catch (err) {
-      setError(getErrorMessage(err));
+      setUpdateCheckError(getErrorMessage(err));
     } finally {
       setCheckingUpdates(false);
     }
@@ -512,6 +518,12 @@ export const PluginsSettingsSection: React.FC = () => {
           <div className="bg-destructive/10 text-destructive mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm">
             <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
             <span className="break-words">{error}</span>
+          </div>
+        )}
+        {updateCheckError && (
+          <div className="mb-3 flex items-start gap-2 rounded-md bg-yellow-500/10 px-3 py-2 text-sm text-yellow-500">
+            <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+            <span className="break-words">Update check failed: {updateCheckError}</span>
           </div>
         )}
 

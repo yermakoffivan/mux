@@ -878,7 +878,16 @@ export class AgentPluginInstallService {
         throw new Error(`Failed to persist the plugin registry: ${getErrorMessage(error)}`);
       }
       if (stagedTree) {
-        await this.removeDir(trashDir);
+        // Best-effort, as documented above: a locked staged tree must not
+        // abort the remaining uninstall steps (override pruning below keeps
+        // reinstall from silently re-enabling servers via the same instance
+        // ID). Leftovers are reclaimed by purgeStaleStaging.
+        await this.removeDir(trashDir).catch((error: unknown) => {
+          log.warn("Failed to delete uninstalled plugin tree; leaving it for staging reclamation", {
+            trashDir,
+            error: getErrorMessage(error),
+          });
+        });
       }
 
       await this.pruneWorkspaceOverrides(serverKeyPrefix);
@@ -1019,8 +1028,15 @@ export class AgentPluginInstallService {
         await this.removeDir(path.join(stagedDir, ".git"));
 
         const targetPath = this.targetPathFor(entry.name);
+        const serverKeyPrefix = buildPluginServerKey(this.instanceIdFor(entry.name), "");
         const trashDir = path.join(this.stagingRoot, `trash-${Date.now()}-${entry.name}`);
         const hadOldTree = await pathExists(targetPath);
+
+        // Stop this plugin's running MCP servers BEFORE the old tree moves:
+        // a live server can lose its files mid-swap on POSIX, and open
+        // handles can make the rename itself fail on Windows.
+        await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
+
         if (hadOldTree) {
           await fsPromises.rename(targetPath, trashDir);
         }
@@ -1040,7 +1056,14 @@ export class AgentPluginInstallService {
           throw error;
         }
         if (hadOldTree) {
-          await this.removeDir(trashDir);
+          // Best-effort: the trash dir sits under the staging root, where
+          // stale-dir reclamation cleans up leftovers.
+          await this.removeDir(trashDir).catch((error: unknown) => {
+            log.warn("Failed to delete replaced plugin tree; leaving it for staging reclamation", {
+              trashDir,
+              error: getErrorMessage(error),
+            });
+          });
         }
 
         const updated: AgentPluginInstallEntry = {
@@ -1059,13 +1082,13 @@ export class AgentPluginInstallService {
         // retrying the update self-heals the mismatch.
         await this.writeRegistry(registry.map((e) => (e.name === entry.name ? updated : e)));
 
-        // Content changed behind a stable path (and possibly an unchanged
-        // stdio command line) — the signature check cannot see it, so recycle
-        // explicitly. Servers restart on next use, default-disabled state and
-        // workspace overrides are untouched (identity is the lexical path).
-        await this.deps.mcpServerManager?.stopServersWithKeyPrefix(
-          buildPluginServerKey(this.instanceIdFor(entry.name), "")
-        );
+        // Recycle again post-promote: content changed behind a stable path
+        // (and possibly an unchanged stdio command line), which the config
+        // signature cannot see — and a concurrent stream may have relaunched
+        // servers against the old tree between the pre-swap stop and now.
+        // Servers restart on next use; default-disabled state and workspace
+        // overrides are untouched (identity is the lexical path).
+        await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
 
         log.info(
           `Updated agent plugin '${entry.name}' ${entry.lockedSha.slice(0, 12)} → ${resolved.sha.slice(0, 12)}`

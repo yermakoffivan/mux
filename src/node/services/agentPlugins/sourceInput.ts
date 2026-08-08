@@ -59,9 +59,13 @@ export function parseAgentPluginSourceInput(rawInput: string): ParsedAgentPlugin
 
   if (isUrlLike(input)) {
     // Git is spawned without a shell, so `~` never expands on its own —
-    // resolve home-relative local paths here.
-    if (input === "~" || input.startsWith("~/")) {
-      return { url: path.join(os.homedir(), input.slice(1)) };
+    // resolve home-relative local paths here (both separator styles, so a
+    // Windows-native `~\plugins\demo` doesn't hand git a literal tilde).
+    if (input === "~") {
+      return { url: os.homedir() };
+    }
+    if (input.startsWith("~/") || input.startsWith("~\\")) {
+      return { url: path.join(os.homedir(), input.slice(2)) };
     }
     // normalizeRepoUrlForClone strips query strings/fragments from URL-like inputs.
     return { url: normalizeRepoUrlForClone(input) };
