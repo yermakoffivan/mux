@@ -566,6 +566,53 @@ describe("AgentPluginInstallService", () => {
     }
   });
 
+  test("install refuses names owned by entries this build cannot parse", async () => {
+    // A newer build's entry (unknown source kind) named demo-plugin, with no
+    // directory on disk: this build must still treat the name as taken —
+    // installing over it would filter the raw entry out and replace it.
+    await fsPromises.writeFile(
+      registryFile(),
+      JSON.stringify({
+        plugins: [
+          {
+            name: "demo-plugin",
+            scope: "global",
+            source: { type: "archive", url: "https://example.com/p.tgz" },
+            lockedSha: "c".repeat(40),
+            installedAt: "2026-09-01T00:00:00.000Z",
+          },
+        ],
+      })
+    );
+
+    await expect(service.preview({ input: remoteDir })).rejects.toThrow(/already installed/);
+    // The unrecognized entry is untouched.
+    expect(await registry()).toHaveLength(1);
+  });
+
+  test("mutations refuse an unreadable registry file (non-ENOENT read failure)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await fsPromises.chmod(registryFile(), 0o000);
+    try {
+      // Reads degrade to unmanaged; mutations refuse instead of letting the
+      // atomic write replace the unreadable file and erase its entries.
+      const items = await service.list();
+      expect(items[0]).toMatchObject({ name: "demo-plugin", managed: false });
+      await expect(
+        service.uninstall({ name: "demo-plugin", deletePluginData: false })
+      ).rejects.toThrow(/cannot be read/);
+      await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/cannot be read/);
+    } finally {
+      await fsPromises.chmod(registryFile(), 0o644);
+    }
+
+    // Registry intact once readable again.
+    expect(await registry()).toHaveLength(1);
+    expect((await service.list())[0]).toMatchObject({ name: "demo-plugin", managed: true });
+  });
+
   test("registry rewrites preserve unknown top-level envelope fields", async () => {
     // A newer build added top-level registry metadata alongside `plugins`.
     await fsPromises.writeFile(
@@ -707,18 +754,25 @@ describe("AgentPluginInstallService", () => {
   test("install rolls back the promoted dir when the registry write fails", async () => {
     const preview = await service.preview({ input: remoteDir });
 
-    // Occupy the registry path with a directory so the atomic write's rename fails.
-    await fsPromises.mkdir(registryFile(), { recursive: true });
-    await expect(
-      service.install({ source: preview.source, expectedSha: preview.lockedSha })
-    ).rejects.toThrow(/persist the plugin registry/);
+    const internals = service as unknown as {
+      writeRegistry: (envelope: Record<string, unknown>, entries: unknown[]) => Promise<void>;
+    };
+    const writeSpy = spyOn(internals, "writeRegistry").mockImplementationOnce(() =>
+      Promise.reject(new Error("ENOSPC: no space left on device"))
+    );
+    try {
+      await expect(
+        service.install({ source: preview.source, expectedSha: preview.lockedSha })
+      ).rejects.toThrow(/persist the plugin registry/);
+    } finally {
+      writeSpy.mockRestore();
+    }
 
     // No partial state: the promoted dir was rolled back.
     expect(await pathExists(path.join(pluginsDir(), "demo-plugin"))).toBe(false);
     expect(await stagingLeftovers()).toEqual([]);
 
-    // Clearing the obstruction lets the same consented install succeed.
-    await fsPromises.rmdir(registryFile());
+    // The retry of the same consented install succeeds.
     const entry = await service.install({ source: preview.source, expectedSha: preview.lockedSha });
     expect(entry.name).toBe("demo-plugin");
     expect(await registry()).toHaveLength(1);

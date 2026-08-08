@@ -198,7 +198,21 @@ export class AgentPluginInstallService {
     let raw: string;
     try {
       raw = await fsPromises.readFile(this.registryFile, "utf8");
-    } catch {
+    } catch (error) {
+      // Only a MISSING file is an empty registry. Any other read failure
+      // (e.g. an unreadable mode-000 file in a writable ~/.mux) must block
+      // mutations: the atomic write replaces the file wholesale, so treating
+      // "unreadable" as "empty" would erase every existing entry.
+      if (hasErrorCode(error, "ENOENT")) {
+        return { envelope: {}, rawEntries: [] };
+      }
+      if (mode === "strict") {
+        corrupted(`it cannot be read (${getErrorMessage(error)})`);
+      }
+      log.warn("Ignoring unreadable plugin registry file", {
+        file: this.registryFile,
+        error: getErrorMessage(error),
+      });
       return { envelope: {}, rawEntries: [] };
     }
 
@@ -731,8 +745,11 @@ export class AgentPluginInstallService {
   private async assertNoCollision(name: string): Promise<void> {
     // Strict: a corrupted registry must fail installs up front (with the
     // repair message) instead of letting a later strict read fail mid-flow.
-    const registry = await this.readRegistry("strict");
-    if (registry.some((entry) => entry.name === name)) {
+    // Collide on RAW entry names, not just parsed ones: an entry this build
+    // cannot parse (written by a newer build) still owns its name — the
+    // install rewrite would otherwise filter it out and replace it.
+    const { rawEntries } = await this.readRegistryDocument("strict");
+    if (rawEntries.some((rawEntry) => this.rawEntryName(rawEntry) === name)) {
       throw new Error(`A managed plugin named '${name}' is already installed. Uninstall it first.`);
     }
     if (await pathExists(this.targetPathFor(name))) {
