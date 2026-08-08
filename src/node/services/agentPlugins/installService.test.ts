@@ -375,6 +375,74 @@ describe("AgentPluginInstallService", () => {
     expect(installedManifest.version).toBe("1.0.0");
   });
 
+  test("registry rewrites preserve entries and fields from newer builds", async () => {
+    // Simulate a newer build's registry content: an unknown source kind and
+    // an extra per-entry field this build's schemas do not know about.
+    const futureEntry = {
+      name: "future-plugin",
+      scope: "global",
+      source: { type: "archive", url: "https://example.com/p.tgz", sha256: "ab" },
+      lockedSha: "b".repeat(40),
+      installedAt: "2026-09-01T00:00:00.000Z",
+      futureField: { nested: true },
+    };
+    await fsPromises.writeFile(registryFile(), JSON.stringify({ plugins: [futureEntry] }));
+
+    // Full lifecycle on this build: install, update, uninstall of a git plugin.
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await writePluginFixture(remoteDir, { version: "2.0.0" });
+    await commitAll(remoteDir, "v2");
+    await service.update({ name: "demo-plugin" });
+    await service.uninstall({ name: "demo-plugin", deletePluginData: false });
+
+    // The unrecognized entry survived every rewrite verbatim.
+    expect(await registry()).toEqual([futureEntry]);
+    // And it never surfaced as a managed row this build could mutate.
+    expect((await service.list()).map((item) => item.name)).not.toContain("future-plugin");
+  });
+
+  test("managed list rows keep registry identity when the manifest name drifts", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    // Local edit renames the manifest to another VALID plugin name.
+    const manifestPath = path.join(pluginsDir(), "demo-plugin", "plugin.json");
+    const manifest = JSON.parse(await fsPromises.readFile(manifestPath, "utf8")) as {
+      name: string;
+    };
+    manifest.name = "impostor";
+    await fsPromises.writeFile(manifestPath, JSON.stringify(manifest));
+
+    // The row keeps the registry name (update/uninstall look up by it) and
+    // surfaces the drift; the operations remain usable.
+    const items = await service.list();
+    const row = items.find((item) => item.managed);
+    expect(row?.name).toBe("demo-plugin");
+    expect(row?.description).toContain("impostor");
+    await service.uninstall({ name: "demo-plugin", deletePluginData: false });
+    expect(await registry()).toEqual([]);
+  });
+
+  test("update rejects a tracked ref whose kind changed on the remote", async () => {
+    await git(remoteDir, "branch", "track");
+    const preview = await service.preview({ input: remoteDir, ref: "track" });
+    expect(preview.source.refType).toBe("branch");
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    // The tracked branch is deleted and a tag with the same name appears,
+    // pointing at newer content.
+    await writePluginFixture(remoteDir, { version: "2.0.0" });
+    const newHead = await commitAll(remoteDir, "v2");
+    await git(remoteDir, "branch", "-D", "track");
+    await git(remoteDir, "tag", "track", newHead);
+
+    // A stale Update click must not install tag content while the registry
+    // still claims a branch.
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/now a tag/);
+    expect(((await registry())[0] as { lockedSha: string }).lockedSha).toBe(preview.lockedSha);
+  });
+
   test("registry survives config.json rewrites and drops traversal names on read", async () => {
     const preview = await service.preview({ input: remoteDir });
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });

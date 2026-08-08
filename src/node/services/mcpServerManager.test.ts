@@ -121,6 +121,57 @@ describe("MCPServerManager", () => {
     manager.dispose();
   });
 
+  test("stopServersWithKeyPrefix invalidates instances published by an in-flight startup", async () => {
+    const workspaceId = "ws-swap-race";
+    const pluginKey = "plugin:abc123:echo";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
+    );
+
+    // Block startServers mid-flight so a plugin swap can land while the
+    // instance exists but is not yet published in workspaceServers.
+    let releaseStartup!: () => void;
+    const startupGate = new Promise<void>((resolve) => {
+      releaseStartup = resolve;
+    });
+    const close = mock(() => Promise.resolve(undefined));
+    access.startServers = async () => {
+      await startupGate;
+      return startResult([[pluginKey, { close }]]);
+    };
+
+    const toolsPromise = manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    // Give getToolsForWorkspace time to enter the (gated) startServers call.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // The updater's recycle runs while startup is in flight: the scan sees
+    // nothing (not yet published), so the epoch record must catch it.
+    await manager.stopServersWithKeyPrefix("plugin:abc123:");
+
+    releaseStartup();
+    const result = await toolsPromise;
+
+    // The stale instance was closed instead of published.
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(Object.keys(result.tools)).toEqual([]);
+    const entry = access.workspaceServers.get(workspaceId) as {
+      instances: Map<string, unknown>;
+    };
+    expect(entry.instances.size).toBe(0);
+
+    // Startups that BEGIN after the invalidation are unaffected.
+    const close2 = mock(() => Promise.resolve(undefined));
+    access.startServers = () => Promise.resolve(startResult([[pluginKey, { close: close2 }]]));
+    access.workspaceServers.delete(workspaceId);
+    const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(close2).toHaveBeenCalledTimes(0);
+    expect(Object.keys(second.tools).length).toBeGreaterThanOrEqual(0);
+    const secondEntry = access.workspaceServers.get(workspaceId) as {
+      instances: Map<string, unknown>;
+    };
+    expect(secondEntry.instances.size).toBe(1);
+  });
+
   test("cleanupIdleServers stops idle servers when workspace is not leased", () => {
     const workspaceId = "ws-idle";
 

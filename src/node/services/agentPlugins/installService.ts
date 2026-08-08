@@ -5,7 +5,7 @@ import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
 
 import {
-  AgentPluginRegistryFileSchema,
+  AgentPluginInstallEntrySchema,
   type AgentPluginGitSource,
   type AgentPluginInstallEntry,
 } from "@/common/config/schemas/agentPluginInstalls";
@@ -168,13 +168,13 @@ export class AgentPluginInstallService {
   // ---------------------------------------------------------------------
 
   /**
-   * Lenient-on-read: a missing/corrupt file or invalid entries degrade to
-   * "unmanaged dirs" rather than an error (discovery stays the source of
-   * truth for what loads; the registry only annotates). Name validation in
-   * the schema doubles as a filesystem-safety gate — a traversal name like
-   * `..` must never reach targetPathFor.
+   * Raw `plugins` array exactly as stored on disk. Mutations operate on this
+   * raw list (matching entries by their `name` property) and write it back
+   * verbatim, so entries/fields written by newer builds — future source
+   * kinds, extra registry fields — survive an install/update/uninstall on
+   * this build (upgrade↔downgrade stays lossless).
    */
-  private async readRegistry(): Promise<AgentPluginInstallEntry[]> {
+  private async readRegistryRaw(): Promise<unknown[]> {
     let raw: string;
     try {
       raw = await fsPromises.readFile(this.registryFile, "utf8");
@@ -193,25 +193,28 @@ export class AgentPluginInstallService {
       return [];
     }
 
-    const wrapper = AgentPluginRegistryFileSchema.safeParse(parsedJson);
-    if (wrapper.success) {
-      return wrapper.data.plugins;
-    }
-
-    // Salvage valid entries individually so one bad entry cannot hide the rest.
-    const rawEntries =
-      typeof parsedJson === "object" &&
+    return typeof parsedJson === "object" &&
       parsedJson !== null &&
       Array.isArray((parsedJson as { plugins?: unknown }).plugins)
-        ? (parsedJson as { plugins: unknown[] }).plugins
-        : [];
+      ? (parsedJson as { plugins: unknown[] }).plugins
+      : [];
+  }
+
+  /**
+   * Lenient-on-read: entries this build does not recognize degrade to
+   * "unmanaged dirs" rather than errors (discovery stays the source of truth
+   * for what loads; the registry only annotates) — but they stay in the raw
+   * file. Name validation in the schema doubles as a filesystem-safety gate:
+   * a traversal name like `..` must never reach targetPathFor.
+   */
+  private parseRegistryEntries(rawEntries: unknown[]): AgentPluginInstallEntry[] {
     const entries: AgentPluginInstallEntry[] = [];
     for (const rawEntry of rawEntries) {
-      const parsed = AgentPluginRegistryFileSchema.shape.plugins.element.safeParse(rawEntry);
+      const parsed = AgentPluginInstallEntrySchema.safeParse(rawEntry);
       if (parsed.success) {
         entries.push(parsed.data);
       } else {
-        log.warn("Dropping invalid managed plugin registry entry", {
+        log.debug("Skipping unrecognized managed plugin registry entry (preserved on disk)", {
           entry: rawEntry,
           error: parsed.error.message,
         });
@@ -220,15 +223,29 @@ export class AgentPluginInstallService {
     return entries;
   }
 
+  private async readRegistry(): Promise<AgentPluginInstallEntry[]> {
+    return this.parseRegistryEntries(await this.readRegistryRaw());
+  }
+
+  /** `name` of a raw registry entry, for identity matching during raw rewrites. */
+  private rawEntryName(rawEntry: unknown): string | undefined {
+    if (typeof rawEntry !== "object" || rawEntry === null) {
+      return undefined;
+    }
+    const name = (rawEntry as { name?: unknown }).name;
+    return typeof name === "string" ? name : undefined;
+  }
+
   /**
    * Atomic write that THROWS on failure (unlike Config.saveConfig's
    * log-and-swallow) so callers can roll back filesystem changes instead of
-   * reporting success with an unpersisted registry.
+   * reporting success with an unpersisted registry. Takes the RAW entry list
+   * so unrecognized entries/fields are written back verbatim.
    */
-  private async writeRegistry(entries: AgentPluginInstallEntry[]): Promise<void> {
+  private async writeRegistry(rawEntries: unknown[]): Promise<void> {
     await writeFileAtomic(
       this.registryFile,
-      JSON.stringify({ plugins: entries }, null, 2),
+      JSON.stringify({ plugins: rawEntries }, null, 2),
       "utf-8"
     );
   }
@@ -724,8 +741,11 @@ export class AgentPluginInstallService {
           },
         };
         try {
-          const registry = await this.readRegistry();
-          await this.writeRegistry([...registry.filter((e) => e.name !== name), entry]);
+          const rawRegistry = await this.readRegistryRaw();
+          await this.writeRegistry([
+            ...rawRegistry.filter((rawEntry) => this.rawEntryName(rawEntry) !== name),
+            entry,
+          ]);
         } catch (error) {
           // No partial state: a promote without a registry entry would look
           // like an unmanaged dir and block reinstall.
@@ -777,15 +797,22 @@ export class AgentPluginInstallService {
         }
       }
 
+      // Managed rows keep their REGISTRY identity: update/uninstall look
+      // entries up by this name, so a locally edited/corrupted manifest name
+      // must not make the row unrepairable from Settings. The drift is still
+      // surfaced in the description.
+      const manifestNameDrift =
+        entry !== undefined && plugin.name !== entry.name
+          ? `plugin.json names itself '${plugin.name}' — the installed name '${entry.name}' stays authoritative.`
+          : undefined;
+      const description = manifestNameDrift ?? plugin.manifest.description;
       items.push({
-        name: plugin.name,
+        name: entry?.name ?? plugin.name,
         managed: entry !== undefined,
         present: true,
         location: shortenHome(path.join(plugin.containerPath, plugin.dirName)),
         ...(plugin.manifest.version !== undefined ? { version: plugin.manifest.version } : {}),
-        ...(plugin.manifest.description !== undefined
-          ? { description: plugin.manifest.description }
-          : {}),
+        ...(description !== undefined ? { description } : {}),
         ...(entry !== undefined
           ? {
               source: entry.source,
@@ -832,7 +859,8 @@ export class AgentPluginInstallService {
     this.assertEnabled();
 
     return this.runExclusive(async () => {
-      const registry = await this.readRegistry();
+      const rawRegistry = await this.readRegistryRaw();
+      const registry = this.parseRegistryEntries(rawRegistry);
       const entry = registry.find((e) => e.name === args.name);
       if (!entry) {
         throw new Error(`'${args.name}' is not a managed plugin install.`);
@@ -865,7 +893,9 @@ export class AgentPluginInstallService {
       }
 
       try {
-        await this.writeRegistry(registry.filter((e) => e.name !== entry.name));
+        await this.writeRegistry(
+          rawRegistry.filter((rawEntry) => this.rawEntryName(rawEntry) !== entry.name)
+        );
       } catch (error) {
         if (stagedTree) {
           await fsPromises.rename(trashDir, targetPath).catch((rollbackError: unknown) => {
@@ -999,7 +1029,8 @@ export class AgentPluginInstallService {
     this.assertEnabled();
 
     return this.runExclusive(async () => {
-      const registry = await this.readRegistry();
+      const rawRegistry = await this.readRegistryRaw();
+      const registry = this.parseRegistryEntries(rawRegistry);
       const entry = registry.find((e) => e.name === args.name);
       if (!entry) {
         throw new Error(`'${args.name}' is not a managed plugin install.`);
@@ -1011,6 +1042,16 @@ export class AgentPluginInstallService {
       }
 
       const resolved = await this.resolveRemoteRef(entry.source.url, entry.source.ref);
+      if (resolved.refType !== entry.source.refType) {
+        // The ref name now resolves to a different kind on the remote (e.g. a
+        // tracked branch was deleted and a tag of the same name exists). The
+        // update check flags this as an error; a stale Update click must not
+        // silently install content from a different ref kind while the
+        // registry keeps claiming the old one.
+        throw new Error(
+          `Tracked ${entry.source.refType} '${entry.source.ref}' is now a ${resolved.refType} on the remote. Uninstall and reinstall to track it.`
+        );
+      }
       if (resolved.sha === entry.lockedSha) {
         return entry; // Already current.
       }
@@ -1079,8 +1120,15 @@ export class AgentPluginInstallService {
         };
         // The new tree is already promoted; a failed write surfaces as an
         // error and the stale lockedSha keeps the update badge visible, so
-        // retrying the update self-heals the mismatch.
-        await this.writeRegistry(registry.map((e) => (e.name === entry.name ? updated : e)));
+        // retrying the update self-heals the mismatch. Merging over the raw
+        // entry preserves fields a newer build may have added to it.
+        await this.writeRegistry(
+          rawRegistry.map((rawEntry) =>
+            this.rawEntryName(rawEntry) === entry.name
+              ? { ...(rawEntry as Record<string, unknown>), ...updated }
+              : rawEntry
+          )
+        );
 
         // Recycle again post-promote: content changed behind a stable path
         // (and possibly an unchanged stdio command line), which the config

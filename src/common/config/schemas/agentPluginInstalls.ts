@@ -6,12 +6,16 @@ import {
 } from "@/common/utils/agentPluginName";
 
 /**
- * Managed Agent Plugin install registry — persisted as `~/.mux/plugins.json`.
+ * Managed Agent Plugin install registry — persisted as `~/.mux/plugins.json`
+ * with the shape `{ plugins: AgentPluginInstallEntry[] }`.
  *
  * A standalone file (not a `~/.mux/config.json` section) on purpose: older
  * builds rebuild config.json from known fields on every save, so a downgrade
  * would silently drop an embedded registry. A file older builds never touch
- * survives upgrade↔downgrade round-trips.
+ * survives upgrade↔downgrade round-trips. The install service additionally
+ * rewrites the file from its RAW entry list (entries validated per-element
+ * on read, matched by `name` on mutation), so entries and fields written by
+ * newer builds survive mutations on this build.
  *
  * Semantics (mirroring lazy.nvim / Claude Code): `source.ref` is the tracking
  * channel and `lockedSha` is what is actually on disk and runs. Install
@@ -80,11 +84,6 @@ export const AgentPluginInstallEntrySchema = z.object({
 });
 
 export const AgentPluginInstallsSchema = z.array(AgentPluginInstallEntrySchema);
-
-/** On-disk shape of `~/.mux/plugins.json` (object wrapper leaves room for future fields). */
-export const AgentPluginRegistryFileSchema = z.object({
-  plugins: AgentPluginInstallsSchema,
-});
 
 export type AgentPluginGitSource = z.infer<typeof AgentPluginGitSourceSchema>;
 export type AgentPluginInstallSource = z.infer<typeof AgentPluginInstallSourceSchema>;

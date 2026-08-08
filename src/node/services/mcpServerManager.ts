@@ -719,6 +719,16 @@ export interface MCPServerManagerOptions {
 export class MCPServerManager {
   private readonly workspaceServers = new Map<string, WorkspaceServers>();
   private readonly workspaceLeases = new Map<string, number>();
+  /**
+   * Monotonic clock for key-prefix invalidations (stopServersWithKeyPrefix).
+   * getToolsForWorkspace snapshots it before reading config; any prefix
+   * invalidated after that snapshot marks the startup's matching instances
+   * stale, because they may have launched from a plugin tree that was
+   * swapped/deleted mid-startup.
+   */
+  private prefixInvalidationClock = 0;
+  /** Latest invalidation epoch per key prefix. */
+  private readonly prefixInvalidations = new Map<string, number>();
   private readonly idleCheckInterval: ReturnType<typeof setInterval>;
   private inlineServers: Record<string, string> = {};
   private readonly policyService: PolicyService | null;
@@ -1053,6 +1063,11 @@ export class MCPServerManager {
       agentPlugins,
     } = options;
 
+    // Snapshot BEFORE reading config: a plugin swap that lands after this
+    // point may invalidate instances this call starts (see
+    // closeInvalidatedInstances).
+    const startupEpoch = this.prefixInvalidationClock;
+
     // Fetch full server info for project-level allowlists and server filtering
     const allServers = await this.getAllServers(projectPath, trusted, agentPlugins);
 
@@ -1211,6 +1226,9 @@ export class MCPServerManager {
             return this.getToolsForWorkspace(options);
           }
 
+          // Drop retried instances whose plugin tree was swapped mid-startup.
+          await this.closeInvalidatedInstances(retriedInstances, startupEpoch, workspaceId);
+
           for (const [serverName, instance] of retriedInstances) {
             existing.instances.set(serverName, instance);
           }
@@ -1318,6 +1336,9 @@ export class MCPServerManager {
         restartFailedNames = failedNames;
         restartTimedOutNames = timedOutNames;
 
+        // Drop restarted instances whose plugin tree was swapped mid-startup.
+        await this.closeInvalidatedInstances(restartedInstances, startupEpoch, workspaceId);
+
         for (const [serverName, instance] of restartedInstances) {
           existing.instances.set(serverName, instance);
         }
@@ -1391,6 +1412,11 @@ export class MCPServerManager {
       () => this.markActivity(workspaceId)
     );
 
+    // A plugin update/uninstall can swap the tree while startServers was
+    // running; its stopServersWithKeyPrefix scan cannot see instances that
+    // are not published yet, so close them here instead of publishing.
+    await this.closeInvalidatedInstances(instances, startupEpoch, workspaceId);
+
     const allFailedNames = [...restartFailedNames, ...startFailedNames];
     const stats = this.createWorkspaceStats(enabledEntries.length, instances, allFailedNames);
 
@@ -1420,6 +1446,13 @@ export class MCPServerManager {
    */
   async stopServersWithKeyPrefix(prefix: string): Promise<void> {
     assert(prefix.length > 0, "stopServersWithKeyPrefix: prefix must be non-empty");
+    // Record the invalidation FIRST: a getToolsForWorkspace call currently
+    // inside startServers has not published its instances yet, so the scan
+    // below cannot see them — the publish paths compare their pre-startup
+    // epoch snapshot against this record and close matching instances
+    // instead of publishing them.
+    this.prefixInvalidations.set(prefix, ++this.prefixInvalidationClock);
+
     const workspaceIds: string[] = [];
     for (const [workspaceId, entry] of this.workspaceServers) {
       for (const serverKey of entry.instances.keys()) {
@@ -1430,6 +1463,43 @@ export class MCPServerManager {
       }
     }
     await Promise.all(workspaceIds.map((workspaceId) => this.stopServers(workspaceId)));
+  }
+
+  /**
+   * Close and drop instances whose keys match a prefix invalidated after
+   * `startedAtEpoch` (the caller's pre-startup snapshot of the invalidation
+   * clock). Such instances may be running code from a plugin tree that was
+   * swapped or deleted while they were starting; dropping them means the next
+   * MCP use restarts them from the current tree.
+   */
+  private async closeInvalidatedInstances(
+    instances: Map<string, MCPServerInstance>,
+    startedAtEpoch: number,
+    workspaceId: string
+  ): Promise<void> {
+    for (const [serverKey, instance] of [...instances]) {
+      let invalidated = false;
+      for (const [prefix, epoch] of this.prefixInvalidations) {
+        if (epoch > startedAtEpoch && serverKey.startsWith(prefix)) {
+          invalidated = true;
+          break;
+        }
+      }
+      if (!invalidated) {
+        continue;
+      }
+
+      instances.delete(serverKey);
+      log.info("[MCP] Closing instance invalidated during startup (plugin tree swapped)", {
+        workspaceId,
+        serverKey,
+      });
+      try {
+        await instance.close();
+      } catch (error) {
+        log.warn("Failed to close invalidated MCP server instance", { error, serverKey });
+      }
+    }
   }
 
   async stopServers(workspaceId: string): Promise<void> {

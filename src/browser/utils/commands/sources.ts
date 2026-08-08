@@ -1664,6 +1664,9 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                     `Update check failed for ${failed.map((check) => check.name).join(", ")}`
                   );
                 }
+                // A mounted section keeps its own stale updateChecks map;
+                // tell it to re-query so badges match the toast.
+                publishPluginsSectionIntent({ type: "refresh" });
                 if (summary.length === 0) {
                   showCommandFeedbackToast({
                     type: "success",

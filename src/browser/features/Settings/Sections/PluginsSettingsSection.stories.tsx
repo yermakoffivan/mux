@@ -154,6 +154,47 @@ export const InstalledWithUpdateStates: Story = {
   },
 };
 
+/**
+ * Pinned phone viewport for the row layout: long repo paths, badge clusters,
+ * and the action group must not overflow the right edge or starve each other
+ * at narrow widths (AGENTS.md Storybook responsive rule).
+ */
+export const InstalledPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
+  render: () => (
+    <PluginsSectionStoryShell
+      options={{
+        agentPlugins: {
+          items: [MANAGED_ITEM, PINNED_ITEM, UNMANAGED_ITEM],
+          updateChecks: [
+            {
+              name: "grill",
+              status: "update-available",
+              remoteSha: "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3",
+            },
+          ],
+        },
+      }}
+    >
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText("grill");
+    await canvas.findByText("update available");
+    await canvas.findByRole("button", { name: /Update/ });
+  },
+};
+
 export const UninstallConfirmation: Story = {
   render: () => (
     <PluginsSectionStoryShell options={{ agentPlugins: { items: [MANAGED_ITEM] } }}>
