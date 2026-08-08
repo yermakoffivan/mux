@@ -553,6 +553,41 @@ describe("AgentPluginInstallService", () => {
 
     // The corrupt file was never rewritten.
     expect(await fsPromises.readFile(registryFile(), "utf8")).toBe("{ not json");
+
+    // Structurally invalid envelopes (parseable JSON without a plugins
+    // array) are corruption too — {} or {"plugins": null} must not let a
+    // mutation rewrite the registry down to a single entry.
+    for (const invalidEnvelope of ["{}", '{ "plugins": null }', "[]"]) {
+      await fsPromises.writeFile(registryFile(), invalidEnvelope);
+      await expect(
+        service.uninstall({ name: "demo-plugin", deletePluginData: false })
+      ).rejects.toThrow(/corrupted/);
+      expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(invalidEnvelope);
+    }
+  });
+
+  test("registry rewrites preserve unknown top-level envelope fields", async () => {
+    // A newer build added top-level registry metadata alongside `plugins`.
+    await fsPromises.writeFile(
+      registryFile(),
+      JSON.stringify({ registryVersion: 2, migrationState: { seeded: true }, plugins: [] })
+    );
+
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await writePluginFixture(remoteDir, { version: "2.0.0" });
+    await commitAll(remoteDir, "v2");
+    await service.update({ name: "demo-plugin" });
+    await service.uninstall({ name: "demo-plugin", deletePluginData: false });
+
+    // Every mutation rewrote only `plugins`; the envelope survived verbatim.
+    const after = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(after.registryVersion).toBe(2);
+    expect(after.migrationState).toEqual({ seeded: true });
+    expect(after.plugins).toEqual([]);
   });
 
   test("update recycles MCP servers even when the registry write fails post-promote", async () => {
@@ -575,7 +610,7 @@ describe("AgentPluginInstallService", () => {
 
     stops = 0;
     const internals = serviceWithMcp as unknown as {
-      writeRegistry: (entries: unknown[]) => Promise<void>;
+      writeRegistry: (envelope: Record<string, unknown>, entries: unknown[]) => Promise<void>;
     };
     const writeSpy = spyOn(internals, "writeRegistry").mockImplementationOnce(() =>
       Promise.reject(new Error("ENOSPC: no space left on device"))

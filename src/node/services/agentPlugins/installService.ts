@@ -168,24 +168,38 @@ export class AgentPluginInstallService {
   // ---------------------------------------------------------------------
 
   /**
-   * Raw `plugins` array exactly as stored on disk. Mutations operate on this
-   * raw list (matching entries by their `name` property) and write it back
-   * verbatim, so entries/fields written by newer builds — future source
-   * kinds, extra registry fields — survive an install/update/uninstall on
-   * this build (upgrade↔downgrade stays lossless).
+   * The registry document as stored on disk: the top-level ENVELOPE (an
+   * object that must hold a `plugins` array, and may hold future top-level
+   * fields like a registry version) plus the raw entry list. Mutations
+   * operate on the raw entries (matching by their `name` property) and write
+   * the envelope back with only `plugins` replaced, so both unknown entry
+   * fields and unknown top-level fields written by newer builds survive an
+   * install/update/uninstall on this build (upgrade↔downgrade stays
+   * lossless).
    *
-   * A missing file is an empty registry; UNPARSEABLE content is not. Reads
-   * ("lenient") degrade it to [] so the section still renders (dirs show as
-   * unmanaged), but mutations ("strict") must refuse: treating a corrupted
-   * file as empty would let the next install rewrite it with a single entry,
-   * permanently orphaning every previously managed install.
+   * A missing file is an empty registry; corrupted content — unparseable
+   * JSON or a structurally invalid envelope like `{}` / `{"plugins": null}`
+   * — is not. Reads ("lenient") degrade corruption to an empty list so the
+   * section still renders (dirs show as unmanaged), but mutations ("strict")
+   * must refuse: treating a corrupted file as empty would let the next
+   * install rewrite it with a single entry, permanently orphaning every
+   * previously managed install.
    */
-  private async readRegistryRaw(mode: "lenient" | "strict"): Promise<unknown[]> {
+  private async readRegistryDocument(mode: "lenient" | "strict"): Promise<{
+    envelope: Record<string, unknown>;
+    rawEntries: unknown[];
+  }> {
+    const corrupted = (detail: string): never => {
+      throw new Error(
+        `The plugin registry (${shortenHome(this.registryFile)}) is corrupted: ${detail}. Repair or remove the file, then retry.`
+      );
+    };
+
     let raw: string;
     try {
       raw = await fsPromises.readFile(this.registryFile, "utf8");
     } catch {
-      return [];
+      return { envelope: {}, rawEntries: [] };
     }
 
     let parsedJson: unknown;
@@ -193,22 +207,34 @@ export class AgentPluginInstallService {
       parsedJson = JSON.parse(raw);
     } catch (error) {
       if (mode === "strict") {
-        throw new Error(
-          `The plugin registry (${shortenHome(this.registryFile)}) is corrupted and cannot be parsed: ${getErrorMessage(error)}. Repair or remove the file, then retry.`
-        );
+        corrupted(`it cannot be parsed (${getErrorMessage(error)})`);
       }
       log.warn("Ignoring unparseable plugin registry file", {
         file: this.registryFile,
         error: getErrorMessage(error),
       });
-      return [];
+      return { envelope: {}, rawEntries: [] };
     }
 
-    return typeof parsedJson === "object" &&
-      parsedJson !== null &&
-      Array.isArray((parsedJson as { plugins?: unknown }).plugins)
-      ? (parsedJson as { plugins: unknown[] }).plugins
-      : [];
+    if (
+      typeof parsedJson !== "object" ||
+      parsedJson === null ||
+      Array.isArray(parsedJson) ||
+      !Array.isArray((parsedJson as { plugins?: unknown }).plugins)
+    ) {
+      if (mode === "strict") {
+        corrupted("expected an object with a 'plugins' array");
+      }
+      log.warn("Ignoring structurally invalid plugin registry file", {
+        file: this.registryFile,
+      });
+      return { envelope: {}, rawEntries: [] };
+    }
+
+    return {
+      envelope: parsedJson as Record<string, unknown>,
+      rawEntries: (parsedJson as { plugins: unknown[] }).plugins,
+    };
   }
 
   /**
@@ -235,7 +261,7 @@ export class AgentPluginInstallService {
   }
 
   private async readRegistry(mode: "lenient" | "strict"): Promise<AgentPluginInstallEntry[]> {
-    return this.parseRegistryEntries(await this.readRegistryRaw(mode));
+    return this.parseRegistryEntries((await this.readRegistryDocument(mode)).rawEntries);
   }
 
   /** `name` of a raw registry entry, for identity matching during raw rewrites. */
@@ -250,13 +276,17 @@ export class AgentPluginInstallService {
   /**
    * Atomic write that THROWS on failure (unlike Config.saveConfig's
    * log-and-swallow) so callers can roll back filesystem changes instead of
-   * reporting success with an unpersisted registry. Takes the RAW entry list
-   * so unrecognized entries/fields are written back verbatim.
+   * reporting success with an unpersisted registry. Takes the RAW envelope
+   * and entry list so unrecognized top-level fields and entries are written
+   * back verbatim (only `plugins` is replaced).
    */
-  private async writeRegistry(rawEntries: unknown[]): Promise<void> {
+  private async writeRegistry(
+    envelope: Record<string, unknown>,
+    rawEntries: unknown[]
+  ): Promise<void> {
     await writeFileAtomic(
       this.registryFile,
-      JSON.stringify({ plugins: rawEntries }, null, 2),
+      JSON.stringify({ ...envelope, plugins: rawEntries }, null, 2),
       "utf-8"
     );
   }
@@ -754,9 +784,9 @@ export class AgentPluginInstallService {
           },
         };
         try {
-          const rawRegistry = await this.readRegistryRaw("strict");
-          await this.writeRegistry([
-            ...rawRegistry.filter((rawEntry) => this.rawEntryName(rawEntry) !== name),
+          const { envelope, rawEntries } = await this.readRegistryDocument("strict");
+          await this.writeRegistry(envelope, [
+            ...rawEntries.filter((rawEntry) => this.rawEntryName(rawEntry) !== name),
             entry,
           ]);
         } catch (error) {
@@ -872,7 +902,7 @@ export class AgentPluginInstallService {
     this.assertEnabled();
 
     return this.runExclusive(async () => {
-      const rawRegistry = await this.readRegistryRaw("strict");
+      const { envelope, rawEntries: rawRegistry } = await this.readRegistryDocument("strict");
       const registry = this.parseRegistryEntries(rawRegistry);
       const entry = registry.find((e) => e.name === args.name);
       if (!entry) {
@@ -939,6 +969,7 @@ export class AgentPluginInstallService {
 
       try {
         await this.writeRegistry(
+          envelope,
           rawRegistry.filter((rawEntry) => this.rawEntryName(rawEntry) !== entry.name)
         );
       } catch (error) {
@@ -1086,7 +1117,7 @@ export class AgentPluginInstallService {
     this.assertEnabled();
 
     return this.runExclusive(async () => {
-      const rawRegistry = await this.readRegistryRaw("strict");
+      const { envelope, rawEntries: rawRegistry } = await this.readRegistryDocument("strict");
       const registry = this.parseRegistryEntries(rawRegistry);
       const entry = registry.find((e) => e.name === args.name);
       if (!entry) {
@@ -1186,6 +1217,7 @@ export class AgentPluginInstallService {
         // build may have stored there (breaking downgrade round-trips).
         try {
           await this.writeRegistry(
+            envelope,
             rawRegistry.map((rawEntry) => {
               if (this.rawEntryName(rawEntry) !== entry.name) {
                 return rawEntry;
