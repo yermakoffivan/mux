@@ -373,6 +373,78 @@ describe("AgentPluginInstallService", () => {
     expect(await registry()).toEqual([]);
   });
 
+  test("failed per-workspace prunes persist a tombstone that gates reinstall and self-heals", async () => {
+    const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
+    const serverKey = `plugin:${instanceId}:echo`;
+
+    // One local workspace with the plugin's server enabled; its override
+    // file is temporarily unwritable.
+    let overridesBroken = true;
+    let storedOverrides: Record<string, unknown> = { enabledServers: [serverKey] };
+    const overridesStub = {
+      getOverridesForWorkspace: () => {
+        if (overridesBroken) {
+          return Promise.reject(new Error("checkout unavailable"));
+        }
+        return Promise.resolve(storedOverrides);
+      },
+      setOverridesForWorkspace: (_id: string, overrides: Record<string, unknown>) => {
+        storedOverrides = overrides;
+        return Promise.resolve();
+      },
+    };
+    const serviceWithOverrides = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+    });
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
+      Promise.resolve([{ id: "ws-1", runtimeConfig: { type: "local" } }] as unknown as Awaited<
+        ReturnType<Config["getAllWorkspaceMetadata"]>
+      >)
+    );
+
+    try {
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      await serviceWithOverrides.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+      await serviceWithOverrides.uninstall({ name: "demo-plugin", deletePluginData: false });
+
+      // Uninstall committed, but the failed prune left a persisted tombstone.
+      expect(await registry()).toEqual([]);
+      const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+        pendingOverridePrunes?: Array<{ prefix: string; workspaceIds: string[] }>;
+      };
+      expect(doc.pendingOverridePrunes).toEqual([
+        { prefix: `plugin:${instanceId}:`, workspaceIds: ["ws-1"] },
+      ]);
+
+      // Reinstalling the same name is gated while the stale override remains:
+      // the same instance ID would silently re-enable the server.
+      const preview2 = await serviceWithOverrides.preview({ input: remoteDir });
+      await expect(
+        serviceWithOverrides.install({ source: preview2.source, expectedSha: preview2.lockedSha })
+      ).rejects.toThrow(/could not clean up its workspace MCP overrides/);
+
+      // Once the workspace is reachable again, the retry (section open or the
+      // install gate itself) prunes the override and unblocks reinstall.
+      overridesBroken = false;
+      const entry = await serviceWithOverrides.install({
+        source: preview2.source,
+        expectedSha: preview2.lockedSha,
+      });
+      expect(entry.name).toBe("demo-plugin");
+      expect(storedOverrides.enabledServers ?? []).toEqual([]);
+      const docAfter = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+        pendingOverridePrunes?: unknown;
+      };
+      expect(docAfter.pendingOverridePrunes).toBeUndefined();
+    } finally {
+      metadataSpy.mockRestore();
+    }
+  });
+
   test("uninstall stages plugin-data before committing when deletion is requested", async () => {
     const preview = await service.preview({ input: remoteDir });
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
