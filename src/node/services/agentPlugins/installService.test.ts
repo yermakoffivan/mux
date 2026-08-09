@@ -445,6 +445,167 @@ describe("AgentPluginInstallService", () => {
     }
   });
 
+  test("tombstone survives even when both the prune and the shrink write fail", async () => {
+    const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
+    const overridesStub = {
+      getOverridesForWorkspace: () => Promise.reject(new Error("checkout unavailable")),
+      setOverridesForWorkspace: () => Promise.resolve(),
+    };
+    const serviceWithOverrides = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+    });
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
+      Promise.resolve([{ id: "ws-1", runtimeConfig: { type: "local" } }] as unknown as Awaited<
+        ReturnType<Config["getAllWorkspaceMetadata"]>
+      >)
+    );
+
+    try {
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      await serviceWithOverrides.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+
+      // The commit write (which must carry the pessimistic tombstone) runs
+      // for real; the post-prune shrink write fails.
+      const internals = serviceWithOverrides as unknown as {
+        writeRegistry: (envelope: Record<string, unknown>, entries: unknown[]) => Promise<void>;
+      };
+      const originalWrite = internals.writeRegistry.bind(serviceWithOverrides);
+      let writeCalls = 0;
+      const writeSpy = spyOn(internals, "writeRegistry").mockImplementation(
+        (envelope: Record<string, unknown>, entries: unknown[]) => {
+          writeCalls += 1;
+          if (writeCalls === 2) {
+            return Promise.reject(new Error("ENOSPC: no space left on device"));
+          }
+          return originalWrite(envelope, entries);
+        }
+      );
+      try {
+        await serviceWithOverrides.uninstall({ name: "demo-plugin", deletePluginData: false });
+      } finally {
+        writeSpy.mockRestore();
+      }
+
+      // The durable record is the COMMIT write's pessimistic tombstone: even
+      // with the shrink write lost, reinstall stays gated.
+      const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+        pendingOverridePrunes?: Array<{ prefix: string; workspaceIds: string[] }>;
+      };
+      expect(doc.pendingOverridePrunes).toEqual([
+        { prefix: `plugin:${instanceId}:`, workspaceIds: ["ws-1"] },
+      ]);
+      const preview2 = await serviceWithOverrides.preview({ input: remoteDir });
+      await expect(
+        serviceWithOverrides.install({ source: preview2.source, expectedSha: preview2.lockedSha })
+      ).rejects.toThrow(/could not clean up its workspace MCP overrides/);
+    } finally {
+      metadataSpy.mockRestore();
+    }
+  });
+
+  test("tombstones for deleted workspaces retire instead of blocking reinstall forever", async () => {
+    const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
+    // Overrides service that permanently throws (as it would for a workspace
+    // that no longer exists in config).
+    const overridesStub = {
+      getOverridesForWorkspace: () => Promise.reject(new Error("Workspace metadata not found")),
+      setOverridesForWorkspace: () => Promise.resolve(),
+    };
+    const serviceWithOverrides = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+    });
+
+    // Seed a tombstone naming a workspace that is not in config anymore.
+    await fsPromises.writeFile(
+      registryFile(),
+      JSON.stringify({
+        plugins: [],
+        pendingOverridePrunes: [{ prefix: `plugin:${instanceId}:`, workspaceIds: ["ws-deleted"] }],
+      })
+    );
+
+    // The deleted workspace can never reactivate anything, so the reinstall
+    // gate drops it instead of blocking forever on its permanent failure.
+    const preview = await serviceWithOverrides.preview({ input: remoteDir });
+    const entry = await serviceWithOverrides.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+    });
+    expect(entry.name).toBe("demo-plugin");
+    const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      pendingOverridePrunes?: unknown;
+    };
+    expect(doc.pendingOverridePrunes).toBeUndefined();
+  });
+
+  test("tombstone retries on list are serialized with registry mutations", async () => {
+    const instanceId = computePluginInstanceId(path.join(pluginsDir(), "other-name"));
+    // A tombstone whose prune blocks until released, so a mutation can be
+    // issued while the retry's read-modify-write is in flight.
+    let releasePrune!: () => void;
+    const pruneGate = new Promise<void>((resolve) => {
+      releasePrune = resolve;
+    });
+    const overridesStub = {
+      getOverridesForWorkspace: async () => {
+        await pruneGate;
+        return {};
+      },
+      setOverridesForWorkspace: () => Promise.resolve(),
+    };
+    const serviceWithOverrides = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+    });
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
+      Promise.resolve([{ id: "ws-1", runtimeConfig: { type: "local" } }] as unknown as Awaited<
+        ReturnType<Config["getAllWorkspaceMetadata"]>
+      >)
+    );
+    await fsPromises.writeFile(
+      registryFile(),
+      JSON.stringify({
+        plugins: [],
+        pendingOverridePrunes: [{ prefix: `plugin:${instanceId}:`, workspaceIds: ["ws-1"] }],
+      })
+    );
+
+    try {
+      // list() starts the retry, which parks inside the (locked) prune.
+      const listPromise = serviceWithOverrides.list();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // A concurrent install must serialize AFTER the retry's write: without
+      // the shared mutation lock, the retry's stale snapshot would erase the
+      // newly installed entry.
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      const installPromise = serviceWithOverrides.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      releasePrune();
+
+      await listPromise;
+      await installPromise;
+
+      // The installed entry survived the retry's write, and the tombstone cleared.
+      const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+        plugins: Array<{ name: string }>;
+        pendingOverridePrunes?: unknown;
+      };
+      expect(doc.plugins.map((entry) => entry.name)).toEqual(["demo-plugin"]);
+      expect(doc.pendingOverridePrunes).toBeUndefined();
+    } finally {
+      metadataSpy.mockRestore();
+    }
+  });
+
   test("uninstall stages plugin-data before committing when deletion is requested", async () => {
     const preview = await service.preview({ input: remoteDir });
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });

@@ -996,9 +996,27 @@ export class AgentPluginInstallService {
         }
       }
 
+      // The commit write carries a PESSIMISTIC tombstone for every workspace
+      // that needs pruning: if a prune later fails — or the best-effort
+      // shrink write below fails — the durable record already exists.
+      // Over-blocking a reinstall until cleanup is confirmed is safe;
+      // silently losing the record (stale enabledServers reactivating a
+      // reinstalled server) is not.
+      const commitEnvelope = { ...envelope };
+      const pendingForCommit = this.parsePendingOverridePrunes(envelope).filter(
+        (prune) => prune.prefix !== serverKeyPrefix
+      );
+      if (workspaceIdsToPrune.length > 0) {
+        pendingForCommit.push({ prefix: serverKeyPrefix, workspaceIds: workspaceIdsToPrune });
+      }
+      if (pendingForCommit.length > 0) {
+        commitEnvelope.pendingOverridePrunes = pendingForCommit;
+      } else {
+        delete commitEnvelope.pendingOverridePrunes;
+      }
       try {
         await this.writeRegistry(
-          envelope,
+          commitEnvelope,
           rawRegistry.filter((rawEntry) => this.rawEntryName(rawEntry) !== entry.name)
         );
       } catch (error) {
@@ -1042,23 +1060,27 @@ export class AgentPluginInstallService {
       await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
 
       // Per-workspace failures are caught inside; the failure-prone
-      // enumeration already happened pre-commit. Any workspace whose prune
-      // failed gets a persisted tombstone (retried on section open, and a
-      // reinstall of this name is gated on it) so the stale override can
-      // never silently re-enable a reinstalled server.
+      // enumeration already happened pre-commit and the pessimistic
+      // tombstone is already durable (commit write above). Shrink it to what
+      // actually failed — best-effort: a failed shrink leaves the over-broad
+      // tombstone, which self-heals on the next retry (section open or the
+      // reinstall gate).
       const failedPruneIds = await this.pruneWorkspaceOverrides(
         serverKeyPrefix,
         workspaceIdsToPrune
       );
-      if (failedPruneIds.length > 0) {
-        const { envelope, rawEntries } = await this.readRegistryDocument("lenient");
-        const pending = this.parsePendingOverridePrunes(envelope).filter(
+      if (workspaceIdsToPrune.length > 0) {
+        const { envelope: envelopeAfter, rawEntries: entriesAfter } =
+          await this.readRegistryDocument("lenient");
+        const pendingAfter = this.parsePendingOverridePrunes(envelopeAfter).filter(
           (prune) => prune.prefix !== serverKeyPrefix
         );
-        pending.push({ prefix: serverKeyPrefix, workspaceIds: failedPruneIds });
-        await this.writePendingOverridePrunes(envelope, rawEntries, pending).catch(
+        if (failedPruneIds.length > 0) {
+          pendingAfter.push({ prefix: serverKeyPrefix, workspaceIds: failedPruneIds });
+        }
+        await this.writePendingOverridePrunes(envelopeAfter, entriesAfter, pendingAfter).catch(
           (error: unknown) => {
-            log.error("Failed to persist pending override prune tombstone", {
+            log.warn("Failed to shrink pending override prune tombstone (kept pessimistic)", {
               serverKeyPrefix,
               failedPruneIds,
               error: getErrorMessage(error),
@@ -1195,10 +1217,33 @@ export class AgentPluginInstallService {
   }
 
   /**
+   * Retry one tombstone's pruning. Workspaces that no longer exist in the
+   * config are dropped first — a deleted workspace's overrides can never
+   * reactivate anything, so keeping its ID would block reinstall forever.
+   * Returns the IDs that still need pruning (existing workspaces whose
+   * prune failed, or everything when metadata enumeration itself failed).
+   */
+  private async retryPrune(prune: { prefix: string; workspaceIds: string[] }): Promise<string[]> {
+    let liveWorkspaceIds = prune.workspaceIds;
+    try {
+      const allMetadata = await this.config.getAllWorkspaceMetadata();
+      const knownIds = new Set(allMetadata.map((metadata) => metadata.id));
+      liveWorkspaceIds = prune.workspaceIds.filter((workspaceId) => knownIds.has(workspaceId));
+    } catch (error) {
+      // Enumeration failed: keep the full list (over-blocking is safe).
+      log.warn("Failed to reconcile pending override prune against workspaces", {
+        error: getErrorMessage(error),
+      });
+    }
+    return this.pruneWorkspaceOverrides(prune.prefix, liveWorkspaceIds);
+  }
+
+  /**
    * Reinstall gate: a plugin name maps to the same instance ID, so a pending
    * prune for its prefix means stale workspace overrides could re-enable the
    * reinstalled plugin's servers without consent. Retry the prune now; only
-   * a fully successful cleanup unblocks the install.
+   * a fully successful cleanup unblocks the install. Runs under the caller's
+   * exclusive mutation lock (install's runExclusive).
    */
   private async assertNoPendingOverridePrune(name: string): Promise<void> {
     const serverKeyPrefix = buildPluginServerKey(this.instanceIdFor(name), "");
@@ -1209,7 +1254,7 @@ export class AgentPluginInstallService {
       return;
     }
 
-    const failed = await this.pruneWorkspaceOverrides(match.prefix, match.workspaceIds);
+    const failed = await this.retryPrune(match);
     const remaining = pending
       .filter((prune) => prune.prefix !== serverKeyPrefix)
       .concat(failed.length > 0 ? [{ prefix: match.prefix, workspaceIds: failed }] : []);
@@ -1224,34 +1269,39 @@ export class AgentPluginInstallService {
   /**
    * Retry all pending override prunes; persists progress. Best-effort: runs
    * on section open (list), so transient failures self-heal the next time
-   * the affected checkout is reachable.
+   * the affected checkout is reachable. The read-modify-write runs under the
+   * exclusive mutation queue — an install/update/uninstall committing while
+   * the workspace I/O is in flight would otherwise be clobbered by this
+   * write's stale registry snapshot.
    */
   private async retryPendingOverridePrunes(): Promise<void> {
-    const { envelope, rawEntries } = await this.readRegistryDocument("lenient");
-    const pending = this.parsePendingOverridePrunes(envelope);
-    if (pending.length === 0) {
-      return;
-    }
-
-    const remaining: Array<{ prefix: string; workspaceIds: string[] }> = [];
-    for (const prune of pending) {
-      const failed = await this.pruneWorkspaceOverrides(prune.prefix, prune.workspaceIds);
-      if (failed.length > 0) {
-        remaining.push({ prefix: prune.prefix, workspaceIds: failed });
+    return this.runExclusive(async () => {
+      const { envelope, rawEntries } = await this.readRegistryDocument("lenient");
+      const pending = this.parsePendingOverridePrunes(envelope);
+      if (pending.length === 0) {
+        return;
       }
-    }
 
-    const before = pending.reduce((sum, prune) => sum + prune.workspaceIds.length, 0);
-    const after = remaining.reduce((sum, prune) => sum + prune.workspaceIds.length, 0);
-    if (after !== before) {
-      await this.writePendingOverridePrunes(envelope, rawEntries, remaining).catch(
-        (error: unknown) => {
-          log.warn("Failed to persist pending override prune progress", {
-            error: getErrorMessage(error),
-          });
+      const remaining: Array<{ prefix: string; workspaceIds: string[] }> = [];
+      for (const prune of pending) {
+        const failed = await this.retryPrune(prune);
+        if (failed.length > 0) {
+          remaining.push({ prefix: prune.prefix, workspaceIds: failed });
         }
-      );
-    }
+      }
+
+      const before = pending.reduce((sum, prune) => sum + prune.workspaceIds.length, 0);
+      const after = remaining.reduce((sum, prune) => sum + prune.workspaceIds.length, 0);
+      if (after !== before) {
+        await this.writePendingOverridePrunes(envelope, rawEntries, remaining).catch(
+          (error: unknown) => {
+            log.warn("Failed to persist pending override prune progress", {
+              error: getErrorMessage(error),
+            });
+          }
+        );
+      }
+    });
   }
 
   /**
