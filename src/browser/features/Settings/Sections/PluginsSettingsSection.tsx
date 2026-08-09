@@ -354,13 +354,21 @@ export const PluginsSettingsSection: React.FC = () => {
   );
   /** Name of the plugin with an update/uninstall in flight. */
   const [busyPlugin, setBusyPlugin] = useState<string | null>(null);
-  /** Monotonic id of the latest update check; stale responses must not commit state. */
+  /** Monotonic ids of the latest list/update-check requests; stale responses must not commit state. */
+  const listGenerationRef = useRef(0);
   const checkGenerationRef = useRef(0);
 
   const refresh = async () => {
     if (!api) return;
+    // Overlapping list requests race the same way update checks do (mount
+    // fetch vs a refresh published after a palette mutation): an older
+    // response resolving last would resurrect removed rows or old versions.
+    const generation = ++listGenerationRef.current;
     try {
       const result = await api.agentPlugins.list();
+      if (generation !== listGenerationRef.current) {
+        return; // A newer list request superseded this one.
+      }
       if (result.success) {
         setItems(result.data);
         setError(null);
@@ -369,8 +377,10 @@ export const PluginsSettingsSection: React.FC = () => {
         setError(result.error);
       }
     } catch (err) {
-      setItems([]);
-      setError(getErrorMessage(err));
+      if (generation === listGenerationRef.current) {
+        setItems([]);
+        setError(getErrorMessage(err));
+      }
     }
   };
 

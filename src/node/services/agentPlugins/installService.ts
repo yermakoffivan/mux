@@ -930,6 +930,11 @@ export class AgentPluginInstallService {
       const instanceId = this.instanceIdFor(entry.name);
       const serverKeyPrefix = buildPluginServerKey(instanceId, "");
 
+      // Enumerate pruning targets BEFORE committing anything: if this fails,
+      // the uninstall aborts with the install fully intact (retryable from
+      // Settings) instead of leaving stale overrides behind post-commit.
+      const workspaceIdsToPrune = await this.listWorkspaceIdsForOverridePruning();
+
       // Stop running servers before deleting the tree out from under them.
       await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
 
@@ -1026,35 +1031,56 @@ export class AgentPluginInstallService {
       // and can still have discovered the plugin before the rename — its
       // freshly started server would otherwise publish validly and keep
       // running from the removed tree. This runs BEFORE override pruning so
-      // a pruning failure (e.g. metadata enumeration throwing) cannot skip
-      // the correctness-critical invalidation.
+      // pruning problems cannot skip the correctness-critical invalidation.
       await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
 
-      await this.pruneWorkspaceOverrides(serverKeyPrefix);
+      // Per-workspace failures are caught inside; the failure-prone
+      // enumeration already happened pre-commit.
+      await this.pruneWorkspaceOverrides(serverKeyPrefix, workspaceIdsToPrune);
 
       log.info(`Uninstalled agent plugin '${entry.name}'`);
     });
   }
 
   /**
-   * Remove `plugin:<instanceId>:*` keys from every local workspace's MCP
-   * overrides. Best-effort per workspace: a missing checkout must not block
-   * uninstall. Remote runtimes are skipped — they never see plugin servers
+   * Enumerate the local/worktree workspace IDs whose MCP overrides an
+   * uninstall must prune. Called BEFORE the uninstall commits anything:
+   * enumeration is the only pruning step that can fail wholesale (outside
+   * the per-workspace catch), and a post-commit failure would leave stale
+   * overrides with no Settings row left to retry from — a reinstall reuses
+   * the same instance ID and would silently re-enable those servers.
+   * Remote runtimes are skipped — they never see plugin servers
    * (resolveAgentPluginsMcpContext returns null off-host).
    */
-  private async pruneWorkspaceOverrides(serverKeyPrefix: string): Promise<void> {
+  private async listWorkspaceIdsForOverridePruning(): Promise<string[]> {
+    if (!this.deps.workspaceMcpOverridesService) {
+      return [];
+    }
+    const allMetadata = await this.config.getAllWorkspaceMetadata();
+    return allMetadata
+      .filter((metadata) => {
+        const runtimeType = metadata.runtimeConfig.type;
+        return runtimeType === "local" || runtimeType === "worktree";
+      })
+      .map((metadata) => metadata.id);
+  }
+
+  /**
+   * Remove `plugin:<instanceId>:*` keys from the given workspaces' MCP
+   * overrides. Best-effort per workspace: a missing checkout must not block
+   * uninstall.
+   */
+  private async pruneWorkspaceOverrides(
+    serverKeyPrefix: string,
+    workspaceIds: string[]
+  ): Promise<void> {
     const overridesService = this.deps.workspaceMcpOverridesService;
     if (!overridesService) {
       return;
     }
-    const allMetadata = await this.config.getAllWorkspaceMetadata();
-    for (const metadata of allMetadata) {
-      const runtimeType = metadata.runtimeConfig.type;
-      if (runtimeType !== "local" && runtimeType !== "worktree") {
-        continue;
-      }
+    for (const workspaceId of workspaceIds) {
       try {
-        const overrides = await overridesService.getOverridesForWorkspace(metadata.id);
+        const overrides = await overridesService.getOverridesForWorkspace(workspaceId);
         const dropKey = (key: string) => key.startsWith(serverKeyPrefix);
         const enabledServers = overrides.enabledServers?.filter((key) => !dropKey(key));
         const disabledServers = overrides.disabledServers?.filter((key) => !dropKey(key));
@@ -1072,14 +1098,14 @@ export class AgentPluginInstallService {
         if (!changed) {
           continue;
         }
-        await overridesService.setOverridesForWorkspace(metadata.id, {
+        await overridesService.setOverridesForWorkspace(workspaceId, {
           ...(enabledServers !== undefined ? { enabledServers } : {}),
           ...(disabledServers !== undefined ? { disabledServers } : {}),
           ...(toolAllowlist !== undefined ? { toolAllowlist } : {}),
         });
       } catch (error) {
         log.warn("Failed to prune plugin MCP overrides for workspace", {
-          workspaceId: metadata.id,
+          workspaceId,
           error: getErrorMessage(error),
         });
       }

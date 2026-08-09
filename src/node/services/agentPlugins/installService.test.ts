@@ -322,7 +322,7 @@ describe("AgentPluginInstallService", () => {
     expect(treeStates).toEqual([true, false]);
   });
 
-  test("uninstall's post-commit invalidation is not skipped by a pruning failure", async () => {
+  test("uninstall aborts intact when pruning enumeration fails (pre-commit)", async () => {
     let stops = 0;
     const mcpStub = {
       stopServersWithKeyPrefix: () => {
@@ -330,9 +330,12 @@ describe("AgentPluginInstallService", () => {
         return Promise.resolve();
       },
     } as unknown as MCPServerManager;
-    // An overrides service forces pruneWorkspaceOverrides to enumerate
-    // workspace metadata; make that enumeration throw (outside the
-    // per-workspace catch).
+    // An overrides service makes uninstall enumerate workspace metadata (the
+    // only pruning step that can fail wholesale, outside the per-workspace
+    // catch). That enumeration must happen BEFORE anything commits: a
+    // post-commit failure would strand stale enabled-server overrides with
+    // no Settings row left to retry from, and a reinstall (same instance ID)
+    // would silently re-enable those servers.
     const overridesStub = {
       getOverridesForWorkspace: () => Promise.resolve({}),
       setOverridesForWorkspace: () => Promise.resolve(),
@@ -358,12 +361,16 @@ describe("AgentPluginInstallService", () => {
       metadataSpy.mockRestore();
     }
 
-    // Both invalidations ran despite the pruning failure — no server from the
-    // removed tree can be retained.
+    // Nothing was committed and no servers were stopped: the install is fully
+    // intact and the row remains, so the user can simply retry.
+    expect(stops).toBe(0);
+    expect(await registry()).toHaveLength(1);
+    expect(await pathExists(path.join(pluginsDir(), "demo-plugin", "plugin.json"))).toBe(true);
+
+    // The retry completes the uninstall, including both invalidations.
+    await serviceWithMcp.uninstall({ name: "demo-plugin", deletePluginData: false });
     expect(stops).toBe(2);
-    // The uninstall itself was committed before pruning.
     expect(await registry()).toEqual([]);
-    expect(await pathExists(path.join(pluginsDir(), "demo-plugin"))).toBe(false);
   });
 
   test("uninstall stages plugin-data before committing when deletion is requested", async () => {
