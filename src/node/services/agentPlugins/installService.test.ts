@@ -6,6 +6,7 @@ import * as path from "node:path";
 
 import { Config } from "@/node/config";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
+import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { AgentPluginInstallService } from "./installService";
 import {
@@ -339,8 +340,7 @@ describe("AgentPluginInstallService", () => {
     const serviceWithMcp = new AgentPluginInstallService(config, {
       isEnabled: () => true,
       mcpServerManager: mcpStub,
-      workspaceMcpOverridesService:
-        overridesStub as unknown as import("@/node/services/workspaceMcpOverridesService").WorkspaceMcpOverridesService,
+      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
     });
 
     const preview = await serviceWithMcp.preview({ input: remoteDir });
