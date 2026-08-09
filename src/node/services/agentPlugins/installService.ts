@@ -1003,12 +1003,11 @@ export class AgentPluginInstallService {
       // silently losing the record (stale enabledServers reactivating a
       // reinstalled server) is not.
       const commitEnvelope = { ...envelope };
-      const pendingForCommit = this.parsePendingOverridePrunes(envelope).filter(
-        (prune) => prune.prefix !== serverKeyPrefix
+      const pendingForCommit = this.updateRawPendingPrunes(
+        this.rawPendingPrunes(envelope),
+        serverKeyPrefix,
+        workspaceIdsToPrune
       );
-      if (workspaceIdsToPrune.length > 0) {
-        pendingForCommit.push({ prefix: serverKeyPrefix, workspaceIds: workspaceIdsToPrune });
-      }
       if (pendingForCommit.length > 0) {
         commitEnvelope.pendingOverridePrunes = pendingForCommit;
       } else {
@@ -1070,23 +1069,27 @@ export class AgentPluginInstallService {
         workspaceIdsToPrune
       );
       if (workspaceIdsToPrune.length > 0) {
-        const { envelope: envelopeAfter, rawEntries: entriesAfter } =
-          await this.readRegistryDocument("lenient");
-        const pendingAfter = this.parsePendingOverridePrunes(envelopeAfter).filter(
-          (prune) => prune.prefix !== serverKeyPrefix
-        );
-        if (failedPruneIds.length > 0) {
-          pendingAfter.push({ prefix: serverKeyPrefix, workspaceIds: failedPruneIds });
+        // STRICT re-read for the shrink: a lenient read degrading a transient
+        // I/O error or corruption to an empty document would make this write
+        // rewrite plugins.json with an empty plugin list, orphaning every
+        // other managed install. On any failure the pessimistic tombstone
+        // from the commit write simply stays (safe, self-heals on retry).
+        try {
+          const { envelope: envelopeAfter, rawEntries: entriesAfter } =
+            await this.readRegistryDocument("strict");
+          const pendingAfter = this.updateRawPendingPrunes(
+            this.rawPendingPrunes(envelopeAfter),
+            serverKeyPrefix,
+            failedPruneIds
+          );
+          await this.writePendingOverridePrunes(envelopeAfter, entriesAfter, pendingAfter);
+        } catch (error) {
+          log.warn("Failed to shrink pending override prune tombstone (kept pessimistic)", {
+            serverKeyPrefix,
+            failedPruneIds,
+            error: getErrorMessage(error),
+          });
         }
-        await this.writePendingOverridePrunes(envelopeAfter, entriesAfter, pendingAfter).catch(
-          (error: unknown) => {
-            log.warn("Failed to shrink pending override prune tombstone (kept pessimistic)", {
-              serverKeyPrefix,
-              failedPruneIds,
-              error: getErrorMessage(error),
-            });
-          }
-        );
       }
 
       log.info(`Uninstalled agent plugin '${entry.name}'`);
@@ -1176,40 +1179,79 @@ export class AgentPluginInstallService {
    * override file). They are retried on section open (list) and gate a
    * reinstall of the same instance ID, so a stale `enabledServers` key can
    * never silently re-enable a reinstalled plugin's server.
+   *
+   * Rewrites operate on the RAW item list, mirroring the registry-entry
+   * rules: items this build cannot parse (a newer release's tombstone
+   * variant) pass through untouched, and recognized items keep their unknown
+   * fields when their `workspaceIds` shrink.
    */
+  private isRecognizedPrune(
+    item: unknown
+  ): item is { prefix: string; workspaceIds: string[] } & Record<string, unknown> {
+    if (typeof item !== "object" || item === null) {
+      return false;
+    }
+    const prefix = (item as { prefix?: unknown }).prefix;
+    const workspaceIds = (item as { workspaceIds?: unknown }).workspaceIds;
+    return (
+      typeof prefix === "string" &&
+      prefix.length > 0 &&
+      Array.isArray(workspaceIds) &&
+      workspaceIds.every((id): id is string => typeof id === "string")
+    );
+  }
+
+  /** The raw `pendingOverridePrunes` array as stored (unknown variants included). */
+  private rawPendingPrunes(envelope: Record<string, unknown>): unknown[] {
+    const raw = envelope.pendingOverridePrunes;
+    return Array.isArray(raw) ? raw : [];
+  }
+
+  /** Recognized tombstones only (for matching/retrying). */
   private parsePendingOverridePrunes(
     envelope: Record<string, unknown>
   ): Array<{ prefix: string; workspaceIds: string[] }> {
-    const raw = envelope.pendingOverridePrunes;
-    if (!Array.isArray(raw)) {
-      return [];
-    }
-    const pending: Array<{ prefix: string; workspaceIds: string[] }> = [];
-    for (const item of raw) {
-      if (typeof item !== "object" || item === null) continue;
-      const prefix = (item as { prefix?: unknown }).prefix;
-      const workspaceIds = (item as { workspaceIds?: unknown }).workspaceIds;
-      if (
-        typeof prefix === "string" &&
-        prefix.length > 0 &&
-        Array.isArray(workspaceIds) &&
-        workspaceIds.every((id): id is string => typeof id === "string")
-      ) {
-        pending.push({ prefix, workspaceIds });
-      }
-    }
-    return pending;
+    return this.rawPendingPrunes(envelope)
+      .filter((item) => this.isRecognizedPrune(item))
+      .map((item) => ({ prefix: item.prefix, workspaceIds: item.workspaceIds }));
   }
 
-  /** Persist the tombstone list into the envelope (removing the key when empty). */
+  /**
+   * Set this build's tombstone for `prefix` within the raw item list:
+   * removes the recognized item for that prefix (merging its unknown fields
+   * into the replacement) and appends the new one when `workspaceIds` is
+   * non-empty. Unrecognized items are preserved verbatim.
+   */
+  private updateRawPendingPrunes(
+    rawPending: unknown[],
+    prefix: string,
+    workspaceIds: string[]
+  ): unknown[] {
+    const existing = rawPending.find(
+      (item) => this.isRecognizedPrune(item) && item.prefix === prefix
+    );
+    const next = rawPending.filter(
+      (item) => !(this.isRecognizedPrune(item) && item.prefix === prefix)
+    );
+    if (workspaceIds.length > 0) {
+      next.push({
+        ...((existing as Record<string, unknown> | undefined) ?? {}),
+        prefix,
+        workspaceIds,
+      });
+    }
+    return next;
+  }
+
+  /** Persist the raw tombstone list into the envelope (removing the key when empty). */
   private async writePendingOverridePrunes(
     envelope: Record<string, unknown>,
     rawEntries: unknown[],
-    pending: Array<{ prefix: string; workspaceIds: string[] }>
+    rawPending: unknown[]
   ): Promise<void> {
     const nextEnvelope = { ...envelope };
-    if (pending.length > 0) {
-      nextEnvelope.pendingOverridePrunes = pending;
+    if (rawPending.length > 0) {
+      nextEnvelope.pendingOverridePrunes = rawPending;
     } else {
       delete nextEnvelope.pendingOverridePrunes;
     }
@@ -1255,9 +1297,11 @@ export class AgentPluginInstallService {
     }
 
     const failed = await this.retryPrune(match);
-    const remaining = pending
-      .filter((prune) => prune.prefix !== serverKeyPrefix)
-      .concat(failed.length > 0 ? [{ prefix: match.prefix, workspaceIds: failed }] : []);
+    const remaining = this.updateRawPendingPrunes(
+      this.rawPendingPrunes(envelope),
+      serverKeyPrefix,
+      failed
+    );
     await this.writePendingOverridePrunes(envelope, rawEntries, remaining);
     if (failed.length > 0) {
       throw new Error(
@@ -1282,18 +1326,18 @@ export class AgentPluginInstallService {
         return;
       }
 
-      const remaining: Array<{ prefix: string; workspaceIds: string[] }> = [];
+      let rawPending = this.rawPendingPrunes(envelope);
+      let progressed = false;
       for (const prune of pending) {
         const failed = await this.retryPrune(prune);
-        if (failed.length > 0) {
-          remaining.push({ prefix: prune.prefix, workspaceIds: failed });
+        if (failed.length !== prune.workspaceIds.length) {
+          progressed = true;
+          rawPending = this.updateRawPendingPrunes(rawPending, prune.prefix, failed);
         }
       }
 
-      const before = pending.reduce((sum, prune) => sum + prune.workspaceIds.length, 0);
-      const after = remaining.reduce((sum, prune) => sum + prune.workspaceIds.length, 0);
-      if (after !== before) {
-        await this.writePendingOverridePrunes(envelope, rawEntries, remaining).catch(
+      if (progressed) {
+        await this.writePendingOverridePrunes(envelope, rawEntries, rawPending).catch(
           (error: unknown) => {
             log.warn("Failed to persist pending override prune progress", {
               error: getErrorMessage(error),

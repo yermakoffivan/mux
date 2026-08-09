@@ -314,8 +314,13 @@ export class WorkspaceMcpOverridesService {
     runtime: ReturnType<typeof createRuntime>,
     workspacePath: string
   ): Promise<void> {
-    // Best-effort: remove both file names so we never leave conflicting sources behind.
-    await execBuffered(
+    // Remove both file names so we never leave conflicting sources behind.
+    // The exit code MUST be checked: callers (e.g. the Agent Plugin
+    // uninstaller retiring override-prune tombstones) rely on
+    // setOverridesForWorkspace rejecting when clearing overrides failed —
+    // a swallowed `rm` failure would leave a stale enabledServers key that
+    // a plugin reinstall could silently reactivate.
+    const result = await execBuffered(
       runtime,
       `rm -f "${MCP_OVERRIDES_DIR}/${MCP_OVERRIDES_JSONC}" "${MCP_OVERRIDES_DIR}/${MCP_OVERRIDES_JSON}"`,
       {
@@ -323,6 +328,11 @@ export class WorkspaceMcpOverridesService {
         timeout: 10,
       }
     );
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `Failed to remove workspace MCP overrides file: ${result.stderr.trim() || `rm exited with code ${result.exitCode}`}`
+      );
+    }
   }
 
   /**

@@ -543,6 +543,37 @@ describe("AgentPluginInstallService", () => {
     expect(doc.pendingOverridePrunes).toBeUndefined();
   });
 
+  test("tombstone rewrites preserve unknown variants and fields from newer builds", async () => {
+    // A newer build's tombstone variant (unrecognized shape) plus a
+    // recognized tombstone carrying an unknown field, for an unrelated
+    // prefix whose workspace no longer exists (so it retires by itself).
+    const futureVariant = { kind: "future-cleanup", payload: { x: 1 } };
+    const foreignPrune = {
+      prefix: "plugin:0000000000000000:",
+      workspaceIds: ["ws-gone"],
+      reason: "future-field",
+    };
+    await fsPromises.writeFile(
+      registryFile(),
+      JSON.stringify({ plugins: [], pendingOverridePrunes: [futureVariant, foreignPrune] })
+    );
+
+    // A full uninstall cycle rewrites pendingOverridePrunes twice (commit +
+    // shrink); the unknown variant must ride through verbatim.
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await service.uninstall({ name: "demo-plugin", deletePluginData: false });
+
+    const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      pendingOverridePrunes: unknown[];
+    };
+    expect(doc.pendingOverridePrunes).toContainEqual(futureVariant);
+    // The recognized foreign tombstone kept its unknown field (ws-gone is not
+    // in this config, so a retry would retire it — but no retry ran for it
+    // during uninstall, which only touches its own prefix).
+    expect(doc.pendingOverridePrunes).toContainEqual(foreignPrune);
+  });
+
   test("tombstone retries on list are serialized with registry mutations", async () => {
     const instanceId = computePluginInstanceId(path.join(pluginsDir(), "other-name"));
     // A tombstone whose prune blocks until released, so a mutation can be
