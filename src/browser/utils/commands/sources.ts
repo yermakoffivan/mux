@@ -1695,31 +1695,22 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                   showCommandFeedbackToast({ type: "error", message: checks.error });
                   return;
                 }
-                // Moved tags are excluded: tags are supposed to be immutable, so
-                // a moved tag warrants the section's per-plugin warning, not a
-                // bulk apply.
+                // Moved tags are excluded from the bulk apply: tags are
+                // supposed to be immutable, so a moved tag warrants the
+                // section's per-plugin review — but it must never read as
+                // "up to date", so it stays in the summary below.
                 const updatable = checks.data.filter(
                   (check) => check.status === "update-available"
                 );
+                const tagMoved = checks.data
+                  .filter((check) => check.status === "tag-moved")
+                  .map((check) => check.name);
                 // Unreachable remotes are an unknown state, never "up to date" —
                 // and they must stay visible even when other updates succeed.
                 const checkFailures = checks.data
                   .filter((check) => check.status === "error")
                   .map((check) => check.name);
-                if (updatable.length === 0) {
-                  if (checkFailures.length > 0) {
-                    showCommandFeedbackToast({
-                      type: "error",
-                      message: `Update check failed for ${checkFailures.join(", ")}`,
-                    });
-                  } else {
-                    showCommandFeedbackToast({
-                      type: "success",
-                      message: "All plugins are up to date.",
-                    });
-                  }
-                  return;
-                }
+
                 const updateFailures: string[] = [];
                 const updatedNames: string[] = [];
                 for (const check of updatable) {
@@ -1731,7 +1722,9 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                   }
                 }
                 // A mounted section only re-queries from its own handlers, so
-                // tell it the backend state changed under it.
+                // tell it the state changed under it. This runs even when no
+                // branch update applied: the fresh check may have discovered
+                // moved tags or per-plugin errors the section should show.
                 publishPluginsSectionIntent({ type: "refresh" });
 
                 const summary: string[] = [];
@@ -1741,15 +1734,33 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 if (updateFailures.length > 0) {
                   summary.push(`Update failed — ${updateFailures.join("; ")}`);
                 }
+                if (tagMoved.length > 0) {
+                  summary.push(
+                    `Tag moved for ${tagMoved.join(", ")} — review in Settings → Plugins`
+                  );
+                }
                 if (checkFailures.length > 0) {
                   summary.push(`Update check failed for ${checkFailures.join(", ")}`);
                 }
+                if (summary.length === 0) {
+                  showCommandFeedbackToast({
+                    type: "success",
+                    message: "All plugins are up to date.",
+                  });
+                  return;
+                }
                 showCommandFeedbackToast({
-                  // Any failure taints the toast: a partial success must not
-                  // read as a verified all-clear.
-                  type: updateFailures.length > 0 || checkFailures.length > 0 ? "error" : "success",
+                  // Anything unexpected taints the toast: a partial success or
+                  // a moved tag must not read as a verified all-clear.
+                  type:
+                    updateFailures.length > 0 || checkFailures.length > 0 || tagMoved.length > 0
+                      ? "error"
+                      : "success",
                   message: summary.join(". "),
                 });
+                if (tagMoved.length > 0 || checkFailures.length > 0) {
+                  openSettings("plugins");
+                }
               },
             },
           ] satisfies CommandAction[])
