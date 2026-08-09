@@ -944,6 +944,29 @@ interface MCPServerInstance {
   close: () => Promise<void>;
 }
 
+/**
+ * Build the raw-tool wrapper shared by the stdio and remote startup paths.
+ *
+ * Both paths wrap freshly listed MCP tools with the same options — activity
+ * tracking plus marking the live instance closed when a tool call detects a
+ * dead client — and both re-wrap through refreshTools on 2026-07-28+
+ * connections, so the options live in one place instead of being restated per
+ * transport. instanceRef is passed by reference because the instance is only
+ * assigned after the wrapper is built.
+ */
+function createRawToolWrapper(
+  onActivity: () => void,
+  instanceRef: { current: MCPServerInstance | null }
+): (raw: Record<string, Tool>) => Record<string, Tool> {
+  return (raw) =>
+    wrapMCPTools(raw, {
+      onActivity,
+      onClosed: () => {
+        if (instanceRef.current) instanceRef.current.isClosed = true;
+      },
+    });
+}
+
 export type MCPTransportMode = "none" | "stdio_only" | "http_only" | "sse_only" | "mixed";
 
 export interface MCPWorkspaceStats {
@@ -3007,13 +3030,7 @@ export class MCPServerManager {
           return null;
         }
 
-        const wrapRawTools = (raw: Record<string, Tool>) =>
-          wrapMCPTools(raw, {
-            onActivity,
-            onClosed: () => {
-              if (instanceRef.current) instanceRef.current.isClosed = true;
-            },
-          });
+        const wrapRawTools = createRawToolWrapper(onActivity, instanceRef);
 
         const tools = wrapRawTools(rawTools as unknown as Record<string, Tool>);
         const negotiatedPrior = readyClient.priorDiscovery();
@@ -3256,13 +3273,7 @@ export class MCPServerManager {
 
       let clientClosed = false;
 
-      const wrapRawTools = (raw: Record<string, Tool>) =>
-        wrapMCPTools(raw, {
-          onActivity,
-          onClosed: () => {
-            if (instanceRef.current) instanceRef.current.isClosed = true;
-          },
-        });
+      const wrapRawTools = createRawToolWrapper(onActivity, instanceRef);
 
       const tools = wrapRawTools(rawTools as unknown as Record<string, Tool>);
       const negotiatedPrior = activeClient.priorDiscovery();
