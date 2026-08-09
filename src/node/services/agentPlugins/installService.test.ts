@@ -6,7 +6,10 @@ import * as path from "node:path";
 
 import { Config } from "@/node/config";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
-import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
+import {
+  WorkspaceMcpOverridesConflictError,
+  type WorkspaceMcpOverridesService,
+} from "@/node/services/workspaceMcpOverridesService";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { AgentPluginInstallService } from "./installService";
 import {
@@ -357,7 +360,7 @@ describe("AgentPluginInstallService", () => {
     // no Settings row left to retry from, and a reinstall (same instance ID)
     // would silently re-enable those servers.
     const overridesStub = {
-      getOverridesForWorkspace: () => Promise.resolve({}),
+      getOverridesForWorkspace: () => Promise.resolve({ overrides: {}, revision: "r0" }),
       setOverridesForWorkspace: () => Promise.resolve(),
     };
     const serviceWithMcp = new AgentPluginInstallService(config, {
@@ -406,7 +409,10 @@ describe("AgentPluginInstallService", () => {
         if (overridesBroken) {
           return Promise.reject(new Error("checkout unavailable"));
         }
-        return Promise.resolve(storedOverrides);
+        return Promise.resolve({
+          overrides: storedOverrides,
+          revision: JSON.stringify(storedOverrides),
+        });
       },
       setOverridesForWorkspace: (_id: string, overrides: Record<string, unknown>) => {
         storedOverrides = overrides;
@@ -463,6 +469,56 @@ describe("AgentPluginInstallService", () => {
     } finally {
       metadataSpy.mockRestore();
     }
+  });
+
+  test("prune retries after a concurrent overrides save conflicts instead of tombstoning", async () => {
+    const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
+    const serverKey = `plugin:${instanceId}:echo`;
+
+    // A Workspace MCP dialog save lands between the prune's read and write
+    // exactly once; the prune must re-read and complete rather than treating
+    // the transient conflict as a failed workspace.
+    let storedOverrides: Record<string, unknown> = { enabledServers: [serverKey, "other"] };
+    let conflictsRemaining = 1;
+    const overridesStub = {
+      getOverridesForWorkspace: () =>
+        Promise.resolve({ overrides: storedOverrides, revision: JSON.stringify(storedOverrides) }),
+      setOverridesForWorkspace: (_id: string, overrides: Record<string, unknown>) => {
+        if (conflictsRemaining > 0) {
+          conflictsRemaining -= 1;
+          return Promise.reject(new WorkspaceMcpOverridesConflictError());
+        }
+        storedOverrides = overrides;
+        return Promise.resolve();
+      },
+    };
+    const serviceWithOverrides = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      workspaceMcpOverridesService: overridesStub as unknown as WorkspaceMcpOverridesService,
+    });
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
+      Promise.resolve([{ id: "ws-1", runtimeConfig: { type: "local" } }] as unknown as Awaited<
+        ReturnType<Config["getAllWorkspaceMetadata"]>
+      >)
+    );
+
+    try {
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      await serviceWithOverrides.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+      await serviceWithOverrides.uninstall({ name: "demo-plugin", deletePluginData: false });
+    } finally {
+      metadataSpy.mockRestore();
+    }
+
+    // Plugin keys pruned, non-plugin keys kept, and no tombstone persisted.
+    expect(storedOverrides).toEqual({ enabledServers: ["other"] });
+    const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      pendingOverridePrunes?: unknown;
+    };
+    expect(doc.pendingOverridePrunes).toBeUndefined();
   });
 
   test("tombstone survives even when both the prune and the shrink write fail", async () => {
@@ -605,7 +661,7 @@ describe("AgentPluginInstallService", () => {
     const overridesStub = {
       getOverridesForWorkspace: async () => {
         await pruneGate;
-        return {};
+        return { overrides: {}, revision: "r0" };
       },
       setOverridesForWorkspace: () => Promise.resolve(),
     };

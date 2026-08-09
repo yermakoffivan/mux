@@ -1834,12 +1834,23 @@ export const workspace = {
   mcp: {
     get: {
       input: z.object({ workspaceId: z.string() }),
-      output: WorkspaceMCPOverridesSchema,
+      output: z.object({
+        overrides: WorkspaceMCPOverridesSchema,
+        /** Opaque token for optimistic-concurrency saves (set.expectedRevision). */
+        revision: z.string(),
+      }),
     },
     set: {
       input: z.object({
         workspaceId: z.string(),
         overrides: WorkspaceMCPOverridesSchema,
+        /**
+         * Revision returned by get. The save is rejected if the stored
+         * overrides changed since then, so a stale dialog snapshot cannot
+         * silently restore entries removed by a concurrent writer (e.g. an
+         * Agent Plugin uninstall pruning its `plugin:` keys).
+         */
+        expectedRevision: z.string(),
       }),
       output: ResultSchema(z.void(), z.string()),
     },

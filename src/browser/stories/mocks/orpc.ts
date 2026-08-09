@@ -1754,8 +1754,15 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       mcp: {
         get: (input: { workspaceId: string }) =>
-          Promise.resolve(mcpOverrides.get(input.workspaceId) ?? {}),
-        set: (input: { workspaceId: string; overrides: MockMcpOverrides }) => {
+          Promise.resolve({
+            overrides: mcpOverrides.get(input.workspaceId) ?? {},
+            revision: "mock-revision",
+          }),
+        set: (input: {
+          workspaceId: string;
+          overrides: MockMcpOverrides;
+          expectedRevision: string;
+        }) => {
           mcpOverrides.set(input.workspaceId, input.overrides);
           return Promise.resolve({ success: true, data: undefined });
         },

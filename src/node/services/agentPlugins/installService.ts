@@ -24,7 +24,10 @@ import type { Config } from "@/node/config";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { log } from "@/node/services/log";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
-import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
+import {
+  WorkspaceMcpOverridesConflictError,
+  type WorkspaceMcpOverridesService,
+} from "@/node/services/workspaceMcpOverridesService";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
@@ -1156,32 +1159,50 @@ export class AgentPluginInstallService {
     if (!overridesService) {
       return [];
     }
+    // A concurrent Workspace MCP dialog save can land between our read and
+    // write; expectedRevision detects that, and we re-read + re-filter.
+    const MAX_CAS_ATTEMPTS = 3;
     const failedWorkspaceIds: string[] = [];
     for (const workspaceId of workspaceIds) {
       try {
-        const overrides = await overridesService.getOverridesForWorkspace(workspaceId);
-        const dropKey = (key: string) => key.startsWith(serverKeyPrefix);
-        const enabledServers = overrides.enabledServers?.filter((key) => !dropKey(key));
-        const disabledServers = overrides.disabledServers?.filter((key) => !dropKey(key));
-        const toolAllowlist = overrides.toolAllowlist
-          ? Object.fromEntries(
-              Object.entries(overrides.toolAllowlist).filter(([key]) => !dropKey(key))
-            )
-          : undefined;
+        for (let attempt = 1; ; attempt++) {
+          const { overrides, revision } =
+            await overridesService.getOverridesForWorkspace(workspaceId);
+          const dropKey = (key: string) => key.startsWith(serverKeyPrefix);
+          const enabledServers = overrides.enabledServers?.filter((key) => !dropKey(key));
+          const disabledServers = overrides.disabledServers?.filter((key) => !dropKey(key));
+          const toolAllowlist = overrides.toolAllowlist
+            ? Object.fromEntries(
+                Object.entries(overrides.toolAllowlist).filter(([key]) => !dropKey(key))
+              )
+            : undefined;
 
-        const changed =
-          (overrides.enabledServers?.length ?? 0) !== (enabledServers?.length ?? 0) ||
-          (overrides.disabledServers?.length ?? 0) !== (disabledServers?.length ?? 0) ||
-          Object.keys(overrides.toolAllowlist ?? {}).length !==
-            Object.keys(toolAllowlist ?? {}).length;
-        if (!changed) {
-          continue;
+          const changed =
+            (overrides.enabledServers?.length ?? 0) !== (enabledServers?.length ?? 0) ||
+            (overrides.disabledServers?.length ?? 0) !== (disabledServers?.length ?? 0) ||
+            Object.keys(overrides.toolAllowlist ?? {}).length !==
+              Object.keys(toolAllowlist ?? {}).length;
+          if (!changed) {
+            break;
+          }
+          try {
+            await overridesService.setOverridesForWorkspace(
+              workspaceId,
+              {
+                ...(enabledServers !== undefined ? { enabledServers } : {}),
+                ...(disabledServers !== undefined ? { disabledServers } : {}),
+                ...(toolAllowlist !== undefined ? { toolAllowlist } : {}),
+              },
+              { expectedRevision: revision }
+            );
+            break;
+          } catch (error) {
+            if (error instanceof WorkspaceMcpOverridesConflictError && attempt < MAX_CAS_ATTEMPTS) {
+              continue;
+            }
+            throw error;
+          }
         }
-        await overridesService.setOverridesForWorkspace(workspaceId, {
-          ...(enabledServers !== undefined ? { enabledServers } : {}),
-          ...(disabledServers !== undefined ? { disabledServers } : {}),
-          ...(toolAllowlist !== undefined ? { toolAllowlist } : {}),
-        });
       } catch (error) {
         failedWorkspaceIds.push(workspaceId);
         log.warn("Failed to prune plugin MCP overrides for workspace", {

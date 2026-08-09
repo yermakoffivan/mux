@@ -5607,7 +5607,7 @@ export const router = (authToken?: string) => {
               policy.mcp.allowUserDefined.remote === false;
 
             if (mcpDisabledByPolicy) {
-              return {};
+              return { overrides: {}, revision: "mcp-disabled-by-policy" };
             }
 
             try {
@@ -5615,8 +5615,10 @@ export const router = (authToken?: string) => {
                 input.workspaceId
               );
             } catch {
-              // Defensive: overrides must never brick workspace UI.
-              return {};
+              // Defensive: overrides must never brick workspace UI. The
+              // sentinel revision never matches a real one, so a save from
+              // this unknown state is rejected instead of clobbering data.
+              return { overrides: {}, revision: "unavailable" };
             }
           }),
         set: t
@@ -5626,7 +5628,8 @@ export const router = (authToken?: string) => {
             try {
               await context.workspaceMcpOverridesService.setOverridesForWorkspace(
                 input.workspaceId,
-                input.overrides
+                input.overrides,
+                { expectedRevision: input.expectedRevision }
               );
               return { success: true, data: undefined };
             } catch (error) {
