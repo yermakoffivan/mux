@@ -570,7 +570,10 @@ export const PluginsSettingsSection: React.FC = () => {
                   <div className="flex flex-wrap items-start justify-between gap-2">
                     <div className="min-w-0">
                       <div className="flex flex-wrap items-baseline gap-2">
-                        <span className="text-foreground text-sm font-medium">{item.name}</span>
+                        {/* break-all: names can be 64 separator-free chars. */}
+                        <span className="text-foreground text-sm font-medium break-all">
+                          {item.name}
+                        </span>
                         {item.version && (
                           <span className="text-muted text-xs">v{item.version}</span>
                         )}
@@ -586,13 +589,16 @@ export const PluginsSettingsSection: React.FC = () => {
                       {item.description && (
                         <p className="text-muted mt-0.5 text-xs">{item.description}</p>
                       )}
-                      <p className="text-muted mt-0.5 text-[11px]">
+                      {/* break-all: locations/sources can contain unbreakable
+                          64-char tokens (max-length plugin names) that would
+                          otherwise overflow the card at phone widths. */}
+                      <p className="text-muted mt-0.5 text-[11px] break-all">
                         {item.skillCount} skill{item.skillCount === 1 ? "" : "s"} ·{" "}
                         {item.mcpServerCount} MCP server{item.mcpServerCount === 1 ? "" : "s"} ·{" "}
                         <code>{item.location}</code>
                       </p>
                       {formatSource(item) && (
-                        <p className="text-muted mt-0.5 text-[11px]">
+                        <p className="text-muted mt-0.5 text-[11px] break-all">
                           {formatSource(item)}
                           {item.lockedSha ? ` · ${item.lockedSha.slice(0, 12)}` : ""}
                         </p>

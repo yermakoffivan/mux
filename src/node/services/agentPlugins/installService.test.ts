@@ -108,6 +108,26 @@ describe("AgentPluginInstallService", () => {
     await fsPromises.rm(remoteDir, { recursive: true, force: true });
   });
 
+  test("consent preview discloses symlinked skills and warns on escaping symlinks", async () => {
+    // Runtime discovery loads symlinked skill dirs, so the preview must
+    // disclose them; symlinks escaping the plugin root are warned about.
+    await fsPromises.mkdir(path.join(remoteDir, "shared", "linked-skill"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "shared", "linked-skill", "SKILL.md"),
+      "---\nname: linked-skill\ndescription: Lives outside skills/, reached via symlink\n---\n\nBody.\n"
+    );
+    await fsPromises.symlink(
+      "../shared/linked-skill",
+      path.join(remoteDir, "skills", "linked-skill")
+    );
+    await fsPromises.symlink("/etc", path.join(remoteDir, "skills", "escaping"));
+    await commitAll(remoteDir, "symlinked skills");
+
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.skills.map((skill) => skill.name)).toEqual(["greet", "linked-skill"]);
+    expect(preview.warnings.some((warning) => warning.includes("skills/escaping"))).toBe(true);
+  });
+
   test("preview stages+validates without writing; install promotes and records the registry", async () => {
     const head = (await git(remoteDir, "rev-parse", "HEAD")).trim();
 

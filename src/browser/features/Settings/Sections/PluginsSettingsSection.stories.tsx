@@ -77,6 +77,26 @@ const MISSING_ITEM: AgentPluginListItem = {
   mcpServerCount: 0,
 };
 
+/** Valid max-length (64-char, separator-free) name: the worst case for narrow-width wrapping. */
+const MAX_LENGTH_NAME = "a".repeat(64);
+const MAX_LENGTH_ITEM: AgentPluginListItem = {
+  name: MAX_LENGTH_NAME,
+  managed: true,
+  present: true,
+  location: `~/.mux/plugins/${MAX_LENGTH_NAME}`,
+  version: "1.0.0",
+  source: {
+    type: "git",
+    url: `https://github.com/example/${MAX_LENGTH_NAME}.git`,
+    ref: "main",
+    refType: "branch",
+  },
+  lockedSha: "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3",
+  installedAt: "2026-08-01T12:00:00.000Z",
+  skillCount: 1,
+  mcpServerCount: 0,
+};
+
 const PluginsSectionStoryShell: FC<{ options: MockORPCClientOptions; children: ReactNode }> = ({
   options,
   children,
@@ -173,7 +193,7 @@ export const InstalledPhoneViewport: Story = {
     <PluginsSectionStoryShell
       options={{
         agentPlugins: {
-          items: [MANAGED_ITEM, PINNED_ITEM, UNMANAGED_ITEM],
+          items: [MANAGED_ITEM, PINNED_ITEM, UNMANAGED_ITEM, MAX_LENGTH_ITEM],
           updateChecks: [
             {
               name: "grill",
@@ -184,7 +204,11 @@ export const InstalledPhoneViewport: Story = {
         },
       }}
     >
-      <PluginsSettingsSection />
+      {/* Fixed phone width so the play's overflow assertion holds in the CI
+          test-runner too, which ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
     </PluginsSectionStoryShell>
   ),
   play: async ({ canvasElement }) => {
@@ -192,6 +216,13 @@ export const InstalledPhoneViewport: Story = {
     await canvas.findByText("grill");
     await canvas.findByText("update available");
     await canvas.findByRole("button", { name: /Update/ });
+    // Max-length separator-free names must wrap instead of overflowing the
+    // card's right edge at phone width.
+    const maxRow = await canvas.findByText(MAX_LENGTH_NAME);
+    const card = maxRow.closest("div[class*='rounded-md']");
+    if (card instanceof HTMLElement && card.scrollWidth > card.clientWidth + 1) {
+      throw new Error("Max-length plugin row overflows its card at phone width");
+    }
   },
 };
 

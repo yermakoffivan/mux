@@ -25,7 +25,7 @@ import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdo
 import { log } from "@/node/services/log";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
-import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
   discoverAgentPluginAt,
@@ -580,17 +580,21 @@ export class AgentPluginInstallService {
   }
 
   private async collectSkills(
-    skillsDir: string | undefined,
+    plugin: Pick<AgentPluginInfo, "rootPath" | "skillsDir">,
     warnings: string[]
   ): Promise<AgentPluginPreviewSkill[]> {
+    const skillsDir = plugin.skillsDir;
     if (skillsDir === undefined) {
       return [];
     }
     const skills: AgentPluginPreviewSkill[] = [];
     let entries: string[] = [];
     try {
+      // Include symlinked skill dirs, matching runtime discovery
+      // (listSkillDirectoriesFromLocalFs): a symlinked skill activates after
+      // install, so it MUST appear in the consent preview.
       entries = (await fsPromises.readdir(skillsDir, { withFileTypes: true }))
-        .filter((entry) => entry.isDirectory())
+        .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
         .map((entry) => entry.name)
         .sort((a, b) => a.localeCompare(b));
     } catch {
@@ -598,16 +602,33 @@ export class AgentPluginInstallService {
     }
     for (const dirName of entries) {
       const skillPath = path.join(skillsDir, dirName, "SKILL.md");
-      // Missing SKILL.md → not a skill dir; skip silently like runtime discovery.
+      // Spec §4.1 containment anchored at the plugin root, mirroring runtime
+      // component checks: a symlink escaping the plugin is surfaced as a
+      // warning instead of silently ignored.
+      let containedSkillPath: string;
+      try {
+        // allowMissing (matching runtime assertSkillDirValid): resolve through
+        // the symlinked dir even when SKILL.md is absent, so an escaping
+        // symlink fails containment instead of hiding behind ENOENT.
+        containedSkillPath = await ensurePathContained(plugin.rootPath, skillPath, {
+          allowMissing: true,
+        });
+      } catch (error) {
+        if (!hasErrorCode(error, "ENOENT")) {
+          warnings.push(`skills/${dirName}: resolves outside the plugin root; it will not load`);
+        }
+        // ENOENT (unresolvable path) → not a skill dir; skip silently.
+        continue;
+      }
       let stat;
       try {
-        stat = await fsPromises.stat(skillPath);
+        stat = await fsPromises.stat(containedSkillPath);
       } catch {
         continue;
       }
       if (!stat.isFile()) continue;
       try {
-        const content = await fsPromises.readFile(skillPath, "utf8");
+        const content = await fsPromises.readFile(containedSkillPath, "utf8");
         const parsed = parseSkillMarkdown({ content, byteSize: stat.size });
         skills.push({
           name: parsed.frontmatter.name,
@@ -708,7 +729,7 @@ export class AgentPluginInstallService {
       const targetPath = this.targetPathFor(plugin.name);
       await this.assertNoCollision(plugin.name);
 
-      const skills = await this.collectSkills(plugin.skillsDir, warnings);
+      const skills = await this.collectSkills(plugin, warnings);
       const mcpServers = await this.collectMcpServers(
         plugin,
         targetPath,
@@ -850,7 +871,7 @@ export class AgentPluginInstallService {
       }
 
       const warnings: string[] = [];
-      const skillCount = (await this.collectSkills(plugin.skillsDir, warnings)).length;
+      const skillCount = (await this.collectSkills(plugin, warnings)).length;
       let mcpServerCount = 0;
       if (plugin.mcpConfigPath !== undefined) {
         try {
