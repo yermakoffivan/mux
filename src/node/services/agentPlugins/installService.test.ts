@@ -321,6 +321,51 @@ describe("AgentPluginInstallService", () => {
     expect(treeStates).toEqual([true, false]);
   });
 
+  test("uninstall's post-commit invalidation is not skipped by a pruning failure", async () => {
+    let stops = 0;
+    const mcpStub = {
+      stopServersWithKeyPrefix: () => {
+        stops += 1;
+        return Promise.resolve();
+      },
+    } as unknown as MCPServerManager;
+    // An overrides service forces pruneWorkspaceOverrides to enumerate
+    // workspace metadata; make that enumeration throw (outside the
+    // per-workspace catch).
+    const overridesStub = {
+      getOverridesForWorkspace: () => Promise.resolve({}),
+      setOverridesForWorkspace: () => Promise.resolve(),
+    };
+    const serviceWithMcp = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      mcpServerManager: mcpStub,
+      workspaceMcpOverridesService:
+        overridesStub as unknown as import("@/node/services/workspaceMcpOverridesService").WorkspaceMcpOverridesService,
+    });
+
+    const preview = await serviceWithMcp.preview({ input: remoteDir });
+    await serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    stops = 0;
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementationOnce(() =>
+      Promise.reject(new Error("metadata enumeration failed"))
+    );
+    try {
+      await expect(
+        serviceWithMcp.uninstall({ name: "demo-plugin", deletePluginData: false })
+      ).rejects.toThrow(/metadata enumeration failed/);
+    } finally {
+      metadataSpy.mockRestore();
+    }
+
+    // Both invalidations ran despite the pruning failure — no server from the
+    // removed tree can be retained.
+    expect(stops).toBe(2);
+    // The uninstall itself was committed before pruning.
+    expect(await registry()).toEqual([]);
+    expect(await pathExists(path.join(pluginsDir(), "demo-plugin"))).toBe(false);
+  });
+
   test("uninstall stages plugin-data before committing when deletion is requested", async () => {
     const preview = await service.preview({ input: remoteDir });
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });

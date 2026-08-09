@@ -1021,14 +1021,16 @@ export class AgentPluginInstallService {
         });
       }
 
-      await this.pruneWorkspaceOverrides(serverKeyPrefix);
-
       // Re-invalidate AFTER the tree is gone: a getToolsForWorkspace call
       // that started right after the pre-rename stop snapshots the new epoch,
       // and can still have discovered the plugin before the rename — its
       // freshly started server would otherwise publish validly and keep
-      // running from the removed tree.
+      // running from the removed tree. This runs BEFORE override pruning so
+      // a pruning failure (e.g. metadata enumeration throwing) cannot skip
+      // the correctness-critical invalidation.
       await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
+
+      await this.pruneWorkspaceOverrides(serverKeyPrefix);
 
       log.info(`Uninstalled agent plugin '${entry.name}'`);
     });
