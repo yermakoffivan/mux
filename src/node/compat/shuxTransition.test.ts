@@ -413,6 +413,119 @@ describe("initializeShuxHomeTransition", () => {
       expect(getShuxHome()).toBe(fallbackPath);
     });
   });
+
+  test("falls back to the populated leftover when empty canonical cannot be removed", async () => {
+    const homeDir = await createTempDir();
+    const canonicalPath = join(homeDir, ".shux");
+    const legacyPath = join(homeDir, ".mux");
+    await fs.mkdir(canonicalPath);
+    await fs.mkdir(legacyPath);
+    await fs.writeFile(join(legacyPath, "config.json"), "legacy", "utf8");
+    const env: Record<string, string | undefined> = {};
+    const rmdir = spyOn(fs, "rmdir").mockImplementation(() => {
+      throw new Error("EBUSY: directory locked");
+    });
+
+    try {
+      const result = await initializeShuxHomeTransition({ homeDir, env, platform: "linux" });
+
+      expect(result.status).toBe("legacy-fallback");
+      expect(result.activePath).toBe(legacyPath);
+      expect(result.canonicalPath).toBe(canonicalPath);
+      expect(result.issues.some((issue) => issue.includes(canonicalPath))).toBe(true);
+      expect(await fs.readFile(join(legacyPath, "config.json"), "utf8")).toBe("legacy");
+      expect((await fs.lstat(canonicalPath)).isDirectory()).toBe(true);
+      expect(await fs.readdir(canonicalPath)).toEqual([]);
+      expect(env.SHUX_ROOT).toBe(legacyPath);
+      expect(env.MUX_ROOT).toBe(legacyPath);
+      withHomeDir(homeDir, () => {
+        process.env.SHUX_ROOT = env.SHUX_ROOT;
+        process.env.MUX_ROOT = env.MUX_ROOT;
+        expect(getShuxHome()).toBe(legacyPath);
+      });
+    } finally {
+      rmdir.mockRestore();
+    }
+  });
+
+  test("falls back to the populated leftover when rename into the empty canonical fails", async () => {
+    const homeDir = await createTempDir();
+    const canonicalPath = join(homeDir, ".shux");
+    const legacyPath = join(homeDir, ".mux");
+    await fs.mkdir(canonicalPath);
+    await fs.mkdir(legacyPath);
+    await fs.writeFile(join(legacyPath, "config.json"), "legacy", "utf8");
+    const env: Record<string, string | undefined> = {};
+    const originalRename = fs.rename.bind(fs);
+    const rename = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (
+        resolve(String(from)) === resolve(legacyPath) &&
+        resolve(String(to)) === resolve(canonicalPath)
+      ) {
+        throw new Error("EPERM: rename blocked");
+      }
+      return await originalRename(from, to);
+    });
+
+    try {
+      const result = await initializeShuxHomeTransition({ homeDir, env, platform: "linux" });
+
+      expect(result.status).toBe("legacy-fallback");
+      expect(result.activePath).toBe(legacyPath);
+      expect(result.canonicalPath).toBe(canonicalPath);
+      expect(await fs.readFile(join(legacyPath, "config.json"), "utf8")).toBe("legacy");
+      expect((await fs.lstat(canonicalPath)).isDirectory()).toBe(true);
+      expect(await fs.readdir(canonicalPath)).toEqual([]);
+      expect(env.SHUX_ROOT).toBe(legacyPath);
+      expect(env.MUX_ROOT).toBe(legacyPath);
+      withHomeDir(homeDir, () => {
+        process.env.SHUX_ROOT = env.SHUX_ROOT;
+        process.env.MUX_ROOT = env.MUX_ROOT;
+        expect(getShuxHome()).toBe(legacyPath);
+      });
+    } finally {
+      rename.mockRestore();
+    }
+  });
+
+  test("retries empty-canonical adoption on the next startup without a persisted ROOT pin", async () => {
+    const homeDir = await createTempDir();
+    const canonicalPath = join(homeDir, ".shux");
+    const legacyPath = join(homeDir, ".mux");
+    await fs.mkdir(canonicalPath);
+    await fs.mkdir(legacyPath);
+    await fs.writeFile(join(legacyPath, "config.json"), "legacy", "utf8");
+    const firstEnv: Record<string, string | undefined> = {};
+    const rmdir = spyOn(fs, "rmdir").mockImplementation(() => {
+      throw new Error("EBUSY: directory locked");
+    });
+
+    try {
+      const first = await initializeShuxHomeTransition({
+        homeDir,
+        env: firstEnv,
+        platform: "linux",
+      });
+      expect(first.status).toBe("legacy-fallback");
+      expect(firstEnv.SHUX_ROOT).toBe(legacyPath);
+    } finally {
+      rmdir.mockRestore();
+    }
+
+    const restartedEnv: Record<string, string | undefined> = {};
+    const second = await initializeShuxHomeTransition({
+      homeDir,
+      env: restartedEnv,
+      platform: "linux",
+    });
+
+    expect(second.status).toBe("migrated");
+    expect(second.activePath).toBe(canonicalPath);
+    expect(restartedEnv.SHUX_ROOT).toBeUndefined();
+    expect(restartedEnv.MUX_ROOT).toBeUndefined();
+    expect(await fs.readFile(join(canonicalPath, "config.json"), "utf8")).toBe("legacy");
+    expect(await fs.realpath(legacyPath)).toBe(await fs.realpath(canonicalPath));
+  });
 });
 
 describe("ensureShuxDirectoryTransition", () => {
@@ -486,6 +599,31 @@ describe("initializeShuxUserDataTransition", () => {
     expect(await fs.realpath(legacyPath)).toBe(await fs.realpath(canonicalPath));
     expect(await fs.realpath(join(appDataDir, "Mux"))).toBe(await fs.realpath(canonicalPath));
     expect((await fs.lstat(canonicalPath)).isDirectory()).toBe(true);
+  });
+
+  test("returns the populated leftover userData path when empty canonical adoption fails", async () => {
+    const appDataDir = await createTempDir();
+    const canonicalPath = join(appDataDir, "shux");
+    const legacyPath = join(appDataDir, "mux");
+    await fs.mkdir(canonicalPath);
+    await fs.mkdir(legacyPath);
+    await fs.writeFile(join(legacyPath, "window-state.json"), "{}", "utf8");
+    const rmdir = spyOn(fs, "rmdir").mockImplementation(() => {
+      throw new Error("EBUSY: directory locked");
+    });
+
+    try {
+      const result = await initializeShuxUserDataTransition({ appDataDir, platform: "linux" });
+
+      expect(result.status).toBe("legacy-fallback");
+      expect(result.activePath).toBe(legacyPath);
+      expect(result.canonicalPath).toBe(canonicalPath);
+      expect(await fs.readFile(join(legacyPath, "window-state.json"), "utf8")).toBe("{}");
+      expect((await fs.lstat(canonicalPath)).isDirectory()).toBe(true);
+      expect(await fs.readdir(canonicalPath)).toEqual([]);
+    } finally {
+      rmdir.mockRestore();
+    }
   });
 
   test("does not merge or delete independent populated userData trees", async () => {

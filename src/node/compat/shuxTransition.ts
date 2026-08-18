@@ -6,6 +6,7 @@ import {
   LEGACY_MUX_HOME_DIR_NAME,
   LEGACY_MUX_PRODUCT_NAME,
   LEGACY_MUX_PRODUCT_SLUG,
+  assignShuxEnvironmentValue,
   installLegacyMuxEnvironmentAliases,
   resolveShuxEnvironmentValue,
   type ShuxEnvironment,
@@ -429,20 +430,23 @@ export async function ensureShuxDirectoryTransition(
         await fs.rename(sourcePath, canonicalPath);
         migratedFrom = sourcePath;
       } catch (error) {
+        // Adoption can fail after Electron creates an empty canonical dir (Windows
+        // locks are the usual case). Keep or restore that empty directory so a later
+        // startup can retry, but activate the populated leftover instead of an empty home.
         issues.push(`Could not move ${sourcePath} into empty ${canonicalPath}: ${String(error)}`);
         if (!(await pathEntryExists(canonicalPath))) {
           try {
             await fs.mkdir(canonicalPath, { recursive: true });
           } catch (restoreError) {
             issues.push(`Could not restore ${canonicalPath}: ${String(restoreError)}`);
-            return {
-              canonicalPath,
-              activePath: await requireHealthyDirectory(sourcePath, issues),
-              status: "legacy-fallback",
-              issues,
-            };
           }
         }
+        return {
+          canonicalPath,
+          activePath: await requireHealthyDirectory(sourcePath, issues),
+          status: "legacy-fallback",
+          issues,
+        };
       }
     }
   }
@@ -562,9 +566,18 @@ export async function initializeShuxHomeTransition(
     legacyPaths.push(join(homeDir, LEGACY_CMUX_HOME_DIR_NAME));
   }
 
-  return await ensureShuxDirectoryTransition({
+  const result = await ensureShuxDirectoryTransition({
     canonicalPath,
     legacyPaths,
     platform: options.platform,
   });
+
+  if (result.status === "legacy-fallback") {
+    // Session-scoped only: point ROOT aliases at the leftover so getShuxHome()
+    // and child processes follow the fallback. Do not persist a marker; the next
+    // startup without ROOT can still migrate once the lock is gone.
+    assignShuxEnvironmentValue(env, "ROOT", result.activePath);
+  }
+
+  return result;
 }

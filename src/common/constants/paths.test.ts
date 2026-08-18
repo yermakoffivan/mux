@@ -3,6 +3,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  promises as fs,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -12,6 +13,7 @@ import * as os from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { initializeShuxHomeTransition } from "@/node/compat/shuxTransition";
+import { sanitizeShuxChildEnv } from "@/node/runtime/childProcessEnv";
 import { cleanupObsoleteShuxBinArtifacts, getShuxHome } from "./paths";
 
 const tempDirs: string[] = [];
@@ -153,6 +155,36 @@ describe("getShuxHome", () => {
       expect(getShuxHome()).toBe(join(homeDir, ".mux"));
       expect(lstatSync(join(homeDir, ".shux")).isFile()).toBe(true);
     });
+  });
+
+  test("follows session ROOT aliases after failed empty-canonical adoption", async () => {
+    const homeDir = createTempMuxRoot();
+    mkdirSync(join(homeDir, ".shux"));
+    mkdirSync(join(homeDir, ".mux"));
+    writeFileSync(join(homeDir, ".mux", "config.json"), "legacy", "utf8");
+    const env: Record<string, string | undefined> = {};
+    const rmdir = spyOn(fs, "rmdir").mockImplementation(() => {
+      throw new Error("EBUSY: directory locked");
+    });
+
+    try {
+      const result = await initializeShuxHomeTransition({ homeDir, env, platform: "linux" });
+
+      expect(result.status).toBe("legacy-fallback");
+      expect(env.SHUX_ROOT).toBe(result.activePath);
+      expect(env.MUX_ROOT).toBe(result.activePath);
+      expect(sanitizeShuxChildEnv(env).SHUX_ROOT).toBe(result.activePath);
+      expect(sanitizeShuxChildEnv(env).MUX_ROOT).toBe(result.activePath);
+
+      withHomeDir(homeDir, () => {
+        process.env.SHUX_ROOT = env.SHUX_ROOT;
+        process.env.MUX_ROOT = env.MUX_ROOT;
+        expect(getShuxHome()).toBe(result.activePath);
+        expect(getShuxHome()).toBe(join(homeDir, ".mux"));
+      });
+    } finally {
+      rmdir.mockRestore();
+    }
   });
 
   test("keeps explicit SHUX_ROOT even when leftover homes exist", () => {
