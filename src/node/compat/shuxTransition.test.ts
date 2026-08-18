@@ -1,7 +1,9 @@
 import { promises as fs } from "node:fs";
-import { tmpdir } from "node:os";
+import * as os from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { getElectronAppIdentity } from "@/common/compat/electronAppIdentity";
+import { getShuxHome } from "@/common/constants/paths";
 import {
   ensureShuxDirectoryTransition,
   initializeShuxHomeTransition,
@@ -11,9 +13,55 @@ import {
 const tempDirs: string[] = [];
 
 async function createTempDir(): Promise<string> {
-  const dir = await fs.mkdtemp(join(tmpdir(), "shux-transition-test-"));
+  const dir = await fs.mkdtemp(join(os.tmpdir(), "shux-transition-test-"));
   tempDirs.push(dir);
   return dir;
+}
+
+function withHomeDir<T>(homeDir: string, run: () => T): T {
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  const previousShuxRoot = process.env.SHUX_ROOT;
+  const previousMuxRoot = process.env.MUX_ROOT;
+  const previousNodeEnv = process.env.NODE_ENV;
+  const homedirSpy = spyOn(os, "homedir");
+  homedirSpy.mockReturnValue(homeDir);
+  process.env.HOME = homeDir;
+  process.env.USERPROFILE = homeDir;
+  delete process.env.SHUX_ROOT;
+  delete process.env.MUX_ROOT;
+  delete process.env.NODE_ENV;
+
+  try {
+    return run();
+  } finally {
+    homedirSpy.mockRestore();
+    if (previousHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = previousHome;
+    }
+    if (previousUserProfile === undefined) {
+      delete process.env.USERPROFILE;
+    } else {
+      process.env.USERPROFILE = previousUserProfile;
+    }
+    if (previousShuxRoot === undefined) {
+      delete process.env.SHUX_ROOT;
+    } else {
+      process.env.SHUX_ROOT = previousShuxRoot;
+    }
+    if (previousMuxRoot === undefined) {
+      delete process.env.MUX_ROOT;
+    } else {
+      process.env.MUX_ROOT = previousMuxRoot;
+    }
+    if (previousNodeEnv === undefined) {
+      delete process.env.NODE_ENV;
+    } else {
+      process.env.NODE_ENV = previousNodeEnv;
+    }
+  }
 }
 
 async function expectMissingPath(path: string): Promise<void> {
@@ -198,6 +246,76 @@ describe("initializeShuxHomeTransition", () => {
     expect(await fs.readFile(join(legacyPath, "legacy"), "utf8")).toBe("old");
     expect((await fs.lstat(legacyPath)).isDirectory()).toBe(true);
   });
+
+  test("prefers a healthy legacy tree when canonical storage is a regular file", async () => {
+    const homeDir = await createTempDir();
+    const canonicalPath = join(homeDir, ".shux");
+    const legacyPath = join(homeDir, ".mux");
+    await fs.writeFile(canonicalPath, "not-a-directory", "utf8");
+    await fs.mkdir(legacyPath);
+    await fs.writeFile(join(legacyPath, "config.json"), "legacy", "utf8");
+
+    const result = await initializeShuxHomeTransition({ homeDir, env: {}, platform: "linux" });
+
+    expect(result.status).toBe("legacy-fallback");
+    expect(result.activePath).toBe(legacyPath);
+    expect(result.canonicalPath).toBe(canonicalPath);
+    expect(result.issues.length).toBeGreaterThan(0);
+    expect(result.issues.some((issue) => issue.includes(canonicalPath))).toBe(true);
+    expect((await fs.lstat(canonicalPath)).isFile()).toBe(true);
+    expect(await fs.readFile(canonicalPath, "utf8")).toBe("not-a-directory");
+    expect(await fs.readFile(join(legacyPath, "config.json"), "utf8")).toBe("legacy");
+    expect((await fs.lstat(legacyPath)).isDirectory()).toBe(true);
+    await expectMissingPath(join(homeDir, ".cmux"));
+    withHomeDir(homeDir, () => {
+      expect(getShuxHome()).toBe(legacyPath);
+    });
+  });
+
+  test("prefers a healthy legacy tree when canonical storage is a broken symlink", async () => {
+    const homeDir = await createTempDir();
+    const canonicalPath = join(homeDir, ".shux");
+    const legacyPath = join(homeDir, ".mux");
+    await fs.symlink(join(homeDir, "missing-target"), canonicalPath);
+    await fs.mkdir(legacyPath);
+    await fs.writeFile(join(legacyPath, "config.json"), "legacy", "utf8");
+
+    const result = await initializeShuxHomeTransition({ homeDir, env: {}, platform: "linux" });
+
+    expect(result.status).toBe("legacy-fallback");
+    expect(result.activePath).toBe(legacyPath);
+    expect(result.canonicalPath).toBe(canonicalPath);
+    expect(result.issues.length).toBeGreaterThan(0);
+    expect(result.issues.some((issue) => issue.includes(canonicalPath))).toBe(true);
+    expect((await fs.lstat(canonicalPath)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(join(legacyPath, "config.json"), "utf8")).toBe("legacy");
+    expect((await fs.lstat(legacyPath)).isDirectory()).toBe(true);
+    await expectMissingPath(join(homeDir, ".cmux"));
+    withHomeDir(homeDir, () => {
+      expect(getShuxHome()).toBe(legacyPath);
+    });
+  });
+
+  test("does not activate an unhealthy canonical path when no healthy legacy tree exists", async () => {
+    const homeDir = await createTempDir();
+    const canonicalPath = join(homeDir, ".shux");
+    const fallbackPath = join(homeDir, ".mux");
+    await fs.writeFile(canonicalPath, "not-a-directory", "utf8");
+
+    const result = await initializeShuxHomeTransition({ homeDir, env: {}, platform: "linux" });
+
+    expect(result.status).toBe("legacy-fallback");
+    expect(result.activePath).toBe(fallbackPath);
+    expect(result.canonicalPath).toBe(canonicalPath);
+    expect(result.issues.length).toBeGreaterThan(0);
+    expect(result.issues.some((issue) => issue.includes(canonicalPath))).toBe(true);
+    expect((await fs.lstat(canonicalPath)).isFile()).toBe(true);
+    expect(await fs.readFile(canonicalPath, "utf8")).toBe("not-a-directory");
+    expect((await fs.lstat(fallbackPath)).isDirectory()).toBe(true);
+    withHomeDir(homeDir, () => {
+      expect(getShuxHome()).toBe(fallbackPath);
+    });
+  });
 });
 
 describe("ensureShuxDirectoryTransition", () => {
@@ -293,5 +411,39 @@ describe("initializeShuxUserDataTransition", () => {
     expect(await fs.readFile(join(productNamePath, "from-Mux"), "utf8")).toBe("older");
     expect((await fs.lstat(muxPath)).isDirectory()).toBe(true);
     expect((await fs.lstat(productNamePath)).isDirectory()).toBe(true);
+  });
+
+  test("prefers a healthy mux userData tree when the canonical entry is a regular file", async () => {
+    const appDataDir = await createTempDir();
+    const canonicalPath = join(appDataDir, "shux");
+    const legacyPath = join(appDataDir, "mux");
+    await fs.writeFile(canonicalPath, "not-a-directory", "utf8");
+    await fs.mkdir(legacyPath);
+    await fs.writeFile(join(legacyPath, "window-state.json"), "{}", "utf8");
+
+    const result = await initializeShuxUserDataTransition({ appDataDir, platform: "linux" });
+
+    expect(result.status).toBe("legacy-fallback");
+    expect(result.activePath).toBe(legacyPath);
+    expect(result.canonicalPath).toBe(canonicalPath);
+    expect(result.issues.length).toBeGreaterThan(0);
+    expect((await fs.lstat(canonicalPath)).isFile()).toBe(true);
+    expect(await fs.readFile(join(legacyPath, "window-state.json"), "utf8")).toBe("{}");
+    expect((await fs.lstat(legacyPath)).isDirectory()).toBe(true);
+    await expectMissingPath(join(appDataDir, "Mux"));
+  });
+
+  test("targets the lowercase slug even when the Electron app name is display-cased", async () => {
+    const appDataDir = await createTempDir();
+
+    for (const platform of ["darwin", "win32"] as const) {
+      const identity = getElectronAppIdentity(platform);
+      const result = await initializeShuxUserDataTransition({ appDataDir, platform });
+
+      expect(identity.appName).not.toBe(identity.userDataDirName);
+      expect(result.canonicalPath).toBe(join(appDataDir, identity.userDataDirName));
+      expect(result.canonicalPath.endsWith(identity.appName)).toBe(false);
+      expect(result.activePath).toBe(result.canonicalPath);
+    }
   });
 });

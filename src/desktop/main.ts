@@ -9,11 +9,12 @@ import { promises as fsPromises } from "node:fs";
 import * as path from "node:path";
 import { createRequire } from "node:module";
 import { cleanupObsoleteShuxBinArtifacts, getShuxHome } from "@/common/constants/paths";
+import { getElectronAppIdentity } from "@/common/compat/electronAppIdentity";
 import {
   SUPPORTED_SHUX_PROTOCOL_SCHEMES,
   resolveShuxEnvironmentValue,
 } from "@/common/compat/legacyMux";
-import { SHUX_PRODUCT_DESCRIPTION, SHUX_PRODUCT_SLUG } from "@/common/constants/product";
+import { SHUX_PRODUCT_DESCRIPTION } from "@/common/constants/product";
 import {
   initializeShuxHomeTransition,
   initializeShuxUserDataTransition,
@@ -61,12 +62,15 @@ const getShuxEnv = (suffix: string): string | undefined =>
 const isE2ETest = getShuxEnv("E2E") === "1";
 const forceDistLoad = getShuxEnv("E2E_LOAD_DIST") === "1";
 
-// Set the canonical display/desktop identity before Electron derives paths or creates windows.
-app.setName(SHUX_PRODUCT_SLUG);
-if (process.platform === "linux") {
-  // Keep Linux WM_CLASS, native-Wayland app_id, desktop files, and icon names aligned.
+// Split display name from desktop/userData identity before Electron creates windows.
+// Linux keeps the lowercase slug for WM_CLASS / Wayland app_id; other platforms use "Shux"
+// so app.getName() (and the macOS application menu) stay display-cased. userData is set
+// explicitly to the slug directory later so setName() cannot fork storage casing.
+const electronAppIdentity = getElectronAppIdentity(process.platform);
+app.setName(electronAppIdentity.appName);
+if (electronAppIdentity.chromeDesktop != null) {
   // sanitizeShuxChildEnv strips CHROME_DESKTOP from child processes launched in terminals.
-  process.env.CHROME_DESKTOP = `${SHUX_PRODUCT_SLUG}.desktop`;
+  process.env.CHROME_DESKTOP = electronAppIdentity.chromeDesktop;
 }
 
 /**
@@ -99,17 +103,22 @@ async function initializeShuxDesktopStorage(): Promise<void> {
     return;
   }
 
+  const appDataDir = app.getPath("appData");
+  const canonicalUserData = path.join(appDataDir, electronAppIdentity.userDataDirName);
   try {
     const transition = await initializeShuxUserDataTransition({
-      appDataDir: app.getPath("appData"),
+      appDataDir,
+      platform: process.platform,
     });
     app.setPath("userData", transition.activePath);
     for (const issue of transition.issues) {
       console.debug("[shux-transition]", issue);
     }
   } catch (error) {
-    // Preserve Electron's default path rather than fail startup when a filesystem blocks aliases.
+    // Never fall back to Electron's name-derived userData: display-cased setName("Shux")
+    // would otherwise create a parallel Shux/ directory beside the canonical shux/ slug.
     console.debug("[shux-transition] Failed Electron userData transition:", error);
+    app.setPath("userData", canonicalUserData);
   }
 }
 

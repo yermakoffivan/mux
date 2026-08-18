@@ -1,5 +1,5 @@
-import { existsSync, lstatSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, lstatSync, rmSync, statSync } from "node:fs";
+import * as os from "node:os";
 import { join } from "node:path";
 import {
   LEGACY_CMUX_HOME_DIR_NAME,
@@ -64,13 +64,27 @@ export function cleanupObsoleteShuxBinArtifacts(rootDir?: string): void {
 }
 
 /**
+ * True only for a usable directory tree. Regular files and broken aliases must
+ * not be treated as configuration or session storage.
+ */
+function isHealthyDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Get the root directory for all shux configuration and data.
  * SHUX_ROOT is canonical; MUX_ROOT remains a downgrade-compatible alias.
  * Appends '-dev' when NODE_ENV=development.
  *
- * Before startup migration completes, a lone legacy directory is returned as a
- * non-destructive fallback. await initializeShuxHomeTransition() moves it to the canonical
- * location and leaves the legacy path pointing forward.
+ * Prefer a usable canonical directory, then the first healthy leftover tree.
+ * A file or broken symlink at ~/.shux is not a home: after
+ * initializeShuxHomeTransition() falls back to ~/.mux, this helper must keep
+ * returning that leftover path. A genuinely empty home still returns the
+ * canonical future path.
  *
  * Main-process only: this helper lives in constants/ for organization, but it
  * reads process.env / homedir and must not be imported from renderer code.
@@ -85,19 +99,20 @@ export function getShuxHome(): string {
 
   // eslint-disable-next-line no-restricted-globals, no-restricted-syntax -- main-only NODE_ENV suffix; see file comment
   const suffix = process.env.NODE_ENV === "development" ? "-dev" : "";
-  const canonicalPath = join(homedir(), SHUX_HOME_DIR_NAME + suffix);
-  if (existsSync(canonicalPath)) {
+  const homeDir = os.homedir();
+  const canonicalPath = join(homeDir, SHUX_HOME_DIR_NAME + suffix);
+  if (isHealthyDirectory(canonicalPath)) {
     return canonicalPath;
   }
 
-  const legacyMuxPath = join(homedir(), LEGACY_MUX_HOME_DIR_NAME + suffix);
-  if (existsSync(legacyMuxPath)) {
+  const legacyMuxPath = join(homeDir, LEGACY_MUX_HOME_DIR_NAME + suffix);
+  if (isHealthyDirectory(legacyMuxPath)) {
     return legacyMuxPath;
   }
 
   if (!suffix) {
-    const legacyCmuxPath = join(homedir(), LEGACY_CMUX_HOME_DIR_NAME);
-    if (existsSync(legacyCmuxPath)) {
+    const legacyCmuxPath = join(homeDir, LEGACY_CMUX_HOME_DIR_NAME);
+    if (isHealthyDirectory(legacyCmuxPath)) {
       return legacyCmuxPath;
     }
   }

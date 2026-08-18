@@ -10,6 +10,7 @@ import {
   resolveShuxEnvironmentValue,
   type ShuxEnvironment,
 } from "@/common/compat/legacyMux";
+import { getElectronAppIdentity } from "@/common/compat/electronAppIdentity";
 import { SHUX_HOME_DIR_NAME } from "@/common/constants/product";
 
 export type ShuxTransitionStatus = "canonical" | "migrated" | "legacy-fallback" | "conflict";
@@ -112,6 +113,41 @@ async function findFirstHealthyDirectory(paths: string[]): Promise<string | unde
   return undefined;
 }
 
+function recordUnusableCanonical(canonicalPath: string, issues: string[]): void {
+  const issue = `${canonicalPath} exists but is not a usable directory; left it unchanged`;
+  if (!issues.includes(issue)) {
+    issues.push(issue);
+  }
+}
+
+/**
+ * Prefer a healthy leftover tree. If none exists, create the first missing
+ * legacy path so callers never receive a file or broken symlink as activePath.
+ */
+async function resolveLegacyFallbackPath(
+  legacyPaths: string[],
+  issues: string[]
+): Promise<string | undefined> {
+  const healthyPath = await findFirstHealthyDirectory(legacyPaths);
+  if (healthyPath) {
+    return healthyPath;
+  }
+
+  for (const fallbackPath of legacyPaths) {
+    if (await pathEntryExists(fallbackPath)) {
+      continue;
+    }
+    try {
+      await fs.mkdir(fallbackPath, { recursive: true });
+      return fallbackPath;
+    } catch (error) {
+      issues.push(`Could not create fallback ${fallbackPath}: ${String(error)}`);
+    }
+  }
+
+  return undefined;
+}
+
 /**
  * Case-insensitive volumes expose `mux` and `Mux` as one directory. Count that
  * as a single tree so we migrate once instead of reporting a false conflict.
@@ -210,6 +246,10 @@ export async function ensureShuxDirectoryTransition(
         };
       }
     }
+  } else if (!(await isHealthyDirectory(canonicalPath))) {
+    // A regular file or broken symlink is not migratable storage. Leave it
+    // untouched so we never overwrite user data or treat a file as userData.
+    recordUnusableCanonical(canonicalPath, issues);
   } else if (await isEmptyRealDirectory(canonicalPath)) {
     // An empty canonical dir plus one populated legacy tree is a leftover split
     // (Electron may mkdir the new app name before we run). Adopt the legacy tree
@@ -239,6 +279,8 @@ export async function ensureShuxDirectoryTransition(
     }
   }
 
+  const canonicalUsableForAliases = await isHealthyDirectory(canonicalPath);
+
   for (const legacyPath of legacyPaths) {
     if (await pathEntryExists(legacyPath)) {
       if (!(await sameExistingEntry(legacyPath, canonicalPath))) {
@@ -246,6 +288,11 @@ export async function ensureShuxDirectoryTransition(
           `Both ${legacyPath} and ${canonicalPath} exist independently; left both unchanged`
         );
       }
+      continue;
+    }
+
+    if (!canonicalUsableForAliases) {
+      // Compatibility aliases must point at a real directory, never a file.
       continue;
     }
 
@@ -274,6 +321,33 @@ export async function ensureShuxDirectoryTransition(
     }
   }
 
+  // conflict keeps a usable canonical tree active. If canonical is not a
+  // directory, prefer the first healthy legacy path instead of handing a file
+  // to Electron userData via activePath.
+  if (!(await isHealthyDirectory(canonicalPath))) {
+    recordUnusableCanonical(canonicalPath, issues);
+    const fallbackPath = await resolveLegacyFallbackPath(legacyPaths, issues);
+    if (fallbackPath != null) {
+      return {
+        canonicalPath,
+        activePath: fallbackPath,
+        status: "legacy-fallback",
+        issues,
+      };
+    }
+    // Nothing usable or creatable remains. Still refuse to treat a file as a
+    // directory; callers get the first leftover name plus explicit issues.
+    const leftoverPath = legacyPaths[0];
+    if (leftoverPath != null) {
+      return {
+        canonicalPath,
+        activePath: leftoverPath,
+        status: "legacy-fallback",
+        issues,
+      };
+    }
+  }
+
   const hasConflict = issues.some((issue) => issue.includes("exist independently"));
   return {
     canonicalPath,
@@ -290,8 +364,11 @@ export async function initializeShuxUserDataTransition(options: {
   // Linux Chromium userData used the case-sensitive product name `Mux` while
   // other platforms stored `mux`. Include both and let same-entry dedupe keep
   // case-insensitive volumes from treating them as two trees.
+  // Canonical userData is always the lowercase slug, even when app.setName() is
+  // display-cased on macOS/Windows.
+  const { userDataDirName } = getElectronAppIdentity(options.platform ?? process.platform);
   return await ensureShuxDirectoryTransition({
-    canonicalPath: join(options.appDataDir, "shux"),
+    canonicalPath: join(options.appDataDir, userDataDirName),
     legacyPaths: [
       join(options.appDataDir, LEGACY_MUX_PRODUCT_SLUG),
       join(options.appDataDir, LEGACY_MUX_PRODUCT_NAME),
