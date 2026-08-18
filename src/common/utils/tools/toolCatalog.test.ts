@@ -341,7 +341,7 @@ describe("extractPreActivatedToolNames", () => {
   });
 
   test("reads MuxMessage dynamic-tool parts (pre-conversion seeding path)", () => {
-    // aiService seeds from MuxMessages (before Mux→Model conversion) so the
+    // aiService seeds from ShuxMessages (before Shux→Model conversion) so the
     // agent-transition sentinel can include pre-activated tools.
     const muxMessage = (toolName: string, state: string, output?: unknown): MuxMessage => {
       const raw: unknown = {
@@ -367,7 +367,7 @@ describe("extractPreActivatedToolNames", () => {
 });
 
 describe("normalizeLegacyToolSearchMessages", () => {
-  test("rewrites completed Mux search history without relabeling unrelated tools", () => {
+  test("rewrites completed Shux search history without relabeling unrelated tools", () => {
     const muxResult = {
       query: "slack",
       matches: [{ name: "slack_send_message", description: "Send" }],

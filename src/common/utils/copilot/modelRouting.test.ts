@@ -28,7 +28,7 @@ describe("isCopilotRoutableModel", () => {
 
 describe("selectCopilotApiMode", () => {
   it("routes Codex-family models to Responses", () => {
-    // opencode routes a wider GPT-5 set through Responses, but Mux scopes that path to Codex first.
+    // opencode routes a wider GPT-5 set through Responses, but Shux scopes that path to Codex first.
     expect(selectCopilotApiMode("gpt-5.3-codex")).toBe("responses");
     expect(selectCopilotApiMode("gpt-5.1-codex-mini")).toBe("responses");
   });

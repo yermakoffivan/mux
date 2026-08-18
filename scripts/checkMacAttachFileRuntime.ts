@@ -7,7 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import sharp from "sharp";
 
-const APP_NAME = "mux.app";
+const APP_NAME = "shux.app";
 const RELEASE_DIR = path.join(process.cwd(), "release");
 const APP_ASAR_UNPACKED_NODE_MODULES = [
   ["node_modules", "sharp"],
@@ -160,7 +160,7 @@ function runPackagedSmokeApp(
   appBundlePath: string,
   fixturePaths: { pngPath: string; jpegPath: string }
 ): void {
-  const executablePath = path.join(appBundlePath, "Contents", "MacOS", "mux");
+  const executablePath = path.join(appBundlePath, "Contents", "MacOS", "shux");
   const tempMuxRoot = path.join(path.dirname(fixturePaths.pngPath), "mux-root");
   const result = spawnSync(executablePath, [], {
     cwd: process.cwd(),

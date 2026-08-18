@@ -1,5 +1,5 @@
 /**
- * Message pipeline: transforms MuxMessages into provider-ready ModelMessages.
+ * Message pipeline: transforms ShuxMessages into provider-ready ModelMessages.
  *
  * This module extracts the message preparation pipeline from `streamMessage()`,
  * making the sequential transform steps explicit and testable.
@@ -77,7 +77,7 @@ export interface PrepareMessagesOptions {
 /**
  * Run the full message preparation pipeline.
  *
- * Transforms pre-filtered `MuxMessage[]` into provider-ready `ModelMessage[]` by:
+ * Transforms pre-filtered `ShuxMessage[]` into provider-ready `ModelMessage[]` by:
  * 1. Injecting agent-transition context (plan→exec handoff)
  * 2. Injecting file-change notifications
  * 3. Injecting post-compaction attachments
@@ -116,7 +116,7 @@ export async function prepareMessagesForProvider(
     workspaceId,
   } = opts;
 
-  // --- MuxMessage-level transforms ---
+  // --- ShuxMessage-level transforms ---
 
   // Inject agent transition context with plan content (for plan→exec handoff)
   const messagesWithAgentContext = injectAgentTransition(
@@ -183,7 +183,7 @@ export async function prepareMessagesForProvider(
 
   // --- Convert to ModelMessage format ---
 
-  // Type assertion needed because MuxMessage has custom tool parts for interrupted tools
+  // Type assertion needed because ShuxMessage has custom tool parts for interrupted tools
   // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument
   const rawModelMessages = await convertToModelMessages(messagesWithSdkSafeFileParts as any, {
     // Drop unfinished tool calls (input-streaming/input-available) so downstream

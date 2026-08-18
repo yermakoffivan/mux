@@ -4,7 +4,7 @@ import {
   isExperimentSupportedOnPlatform,
   type ExperimentId,
 } from "@/common/constants/experiments";
-import { getMuxHome } from "@/common/constants/paths";
+import { getShuxHome } from "@/common/constants/paths";
 import type { TelemetryService } from "@/node/services/telemetryService";
 
 import * as fs from "fs/promises";
@@ -52,7 +52,7 @@ export class ExperimentsService {
     platform?: NodeJS.Platform;
   }) {
     this.telemetryService = options.telemetryService;
-    this.muxHome = options.muxHome ?? getMuxHome();
+    this.muxHome = options.muxHome ?? getShuxHome();
     this.overridesFilePath = path.join(this.muxHome, OVERRIDES_FILE_NAME);
     this.platform = options.platform ?? process.platform;
   }

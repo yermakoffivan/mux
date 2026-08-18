@@ -10,7 +10,7 @@ import {
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, describe, expect, test } from "bun:test";
-import { cleanupObsoleteMuxBinArtifacts } from "./paths";
+import { cleanupObsoleteShuxBinArtifacts } from "./paths";
 
 const tempDirs: string[] = [];
 
@@ -26,7 +26,7 @@ afterEach(() => {
   }
 });
 
-describe("cleanupObsoleteMuxBinArtifacts", () => {
+describe("cleanupObsoleteShuxBinArtifacts", () => {
   test("removes obsolete agent-browser wrapper files from mux bin", () => {
     const muxRoot = createTempMuxRoot();
     const binDir = join(muxRoot, "bin");
@@ -35,7 +35,7 @@ describe("cleanupObsoleteMuxBinArtifacts", () => {
     writeFileSync(join(binDir, "agent-browser.cmd"), "@echo off\n", "utf8");
     writeFileSync(join(binDir, "mux-askpass"), "#!/bin/sh\necho keep\n", "utf8");
 
-    cleanupObsoleteMuxBinArtifacts(muxRoot);
+    cleanupObsoleteShuxBinArtifacts(muxRoot);
 
     expect(existsSync(join(binDir, "agent-browser"))).toBe(false);
     expect(existsSync(join(binDir, "agent-browser.cmd"))).toBe(false);
@@ -49,7 +49,7 @@ describe("cleanupObsoleteMuxBinArtifacts", () => {
     const wrapperDir = join(binDir, "agent-browser");
     mkdirSync(wrapperDir, { recursive: true });
 
-    cleanupObsoleteMuxBinArtifacts(muxRoot);
+    cleanupObsoleteShuxBinArtifacts(muxRoot);
 
     expect(existsSync(wrapperDir)).toBe(true);
     expect(lstatSync(wrapperDir).isDirectory()).toBe(true);
@@ -57,6 +57,6 @@ describe("cleanupObsoleteMuxBinArtifacts", () => {
 
   test("is a no-op when mux bin does not exist", () => {
     const muxRoot = createTempMuxRoot();
-    expect(() => cleanupObsoleteMuxBinArtifacts(muxRoot)).not.toThrow();
+    expect(() => cleanupObsoleteShuxBinArtifacts(muxRoot)).not.toThrow();
   });
 });

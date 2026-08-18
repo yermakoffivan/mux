@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 
 import type { Runtime } from "@/node/runtime/Runtime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
-import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalMuxHome";
+import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalShuxHome";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { getErrorMessage } from "@/common/utils/errors";
 import { execBuffered, readFileString } from "@/node/utils/runtime/helpers";
@@ -51,7 +51,7 @@ export interface AgentSkillsRoots {
   globalClaudeRoot?: string;
   /** Agent Plugins container dirs, e.g. <projectRoot>/.mux/plugins (agent-plugins experiment; read-only). */
   projectPluginRoots?: string[];
-  /** Agent Plugins container dirs, e.g. ~/.mux/plugins (agent-plugins experiment; read-only). */
+  /** Agent Plugins container dirs, e.g. ~/.shux/plugins (agent-plugins experiment; read-only). */
   globalPluginRoots?: string[];
 }
 
@@ -67,7 +67,7 @@ export function getDefaultAgentSkillsRoots(
   return {
     projectRoot: runtime.normalizePath(".mux/skills", workspacePath),
     projectUniversalRoot: runtime.normalizePath(".agents/skills", workspacePath),
-    globalRoot: `${runtime.getMuxHome()}/skills`,
+    globalRoot: `${runtime.getShuxHome()}/skills`,
     universalRoot: UNIVERSAL_SKILLS_ROOT,
     // Claude roots are added only when the experiment is enabled so the default
     // (off) behavior stays byte-identical to the pre-experiment scan order.
@@ -85,7 +85,7 @@ export function getDefaultAgentSkillsRoots(
             runtime.normalizePath(".mux/plugins", workspacePath),
             runtime.normalizePath(".agents/plugins", workspacePath),
           ],
-          globalPluginRoots: [`${runtime.getMuxHome()}/plugins`, UNIVERSAL_PLUGINS_ROOT],
+          globalPluginRoots: [`${runtime.getShuxHome()}/plugins`, UNIVERSAL_PLUGINS_ROOT],
         }
       : {}),
   };
@@ -103,7 +103,7 @@ function getProjectSkillRoots(roots: AgentSkillsRoots): string[] {
 }
 
 function getGlobalSkillRoots(roots: AgentSkillsRoots): string[] {
-  // Precedence within global scope: ~/.mux > ~/.agents > ~/.claude.
+  // Precedence within global scope: ~/.shux > ~/.agents > ~/.claude.
   const orderedRoots = [roots.globalRoot, roots.universalRoot, roots.globalClaudeRoot].filter(
     (root): root is string => root != null && root.length > 0
   );

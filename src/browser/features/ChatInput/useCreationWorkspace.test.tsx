@@ -892,7 +892,7 @@ describe("useCreationWorkspace", () => {
     expect(createRequest?.runtimeConfig).toEqual({
       type: "ssh",
       host: "example.com",
-      srcBaseDir: "~/mux",
+      srcBaseDir: "~/shux",
     });
 
     // workspace.sendMessage should be called with the created workspace ID

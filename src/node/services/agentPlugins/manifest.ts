@@ -13,7 +13,7 @@
  *   alphanumeric start/end, no `--` or `..` runs.
  * - Any other schema violation (wrong-typed permitted field) is fatal.
  * - `extensions`: a non-object value is NON-fatal (report + ignore); namespace
- *   member contents are never validated (§8.1/§11.1) — Mux implements no
+ *   member contents are never validated (§8.1/§11.1) — Shux implements no
  *   extension namespace, so all payloads are treated as opaque.
  */
 

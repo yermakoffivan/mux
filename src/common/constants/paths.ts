@@ -1,13 +1,16 @@
-import { existsSync, lstatSync, renameSync, rmSync, symlinkSync } from "fs";
-import { homedir } from "os";
-import { join } from "path";
-
-const LEGACY_MUX_DIR_NAME = ".cmux";
-const MUX_DIR_NAME = ".mux";
+import { existsSync, lstatSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import {
+  LEGACY_CMUX_HOME_DIR_NAME,
+  LEGACY_MUX_HOME_DIR_NAME,
+  resolveShuxEnvironmentValue,
+} from "@/common/compat/legacyMux";
+import { SHUX_HOME_DIR_NAME } from "@/common/constants/product";
 
 /**
  * Session-dir file holding the active chat history epoch (latest compaction
- * boundary onward). Example: ~/.mux/sessions/<workspace>/chat.jsonl
+ * boundary onward). Example: ~/.shux/sessions/<workspace>/chat.jsonl
  */
 export const CHAT_FILE_NAME = "chat.jsonl";
 
@@ -29,42 +32,16 @@ export const CHAT_ARCHIVE_FILE_NAME = "chat-archive.jsonl";
  */
 export const HEADLESS_USAGE_FILE_NAME = "headless-usage.jsonl";
 
-/**
- * Migrate from the legacy ~/.cmux directory into ~/.mux for rebranded installs.
- * Called on startup to preserve data created by earlier releases.
- *
- * If .mux exists, nothing happens (already migrated).
- * If .cmux exists but .mux doesn't, moves .cmux → .mux and creates symlink.
- * This ensures old scripts/tools referencing ~/.cmux continue working.
- */
-export function migrateLegacyMuxHome(): void {
-  const oldPath = join(homedir(), LEGACY_MUX_DIR_NAME);
-  const newPath = join(homedir(), MUX_DIR_NAME);
-
-  // If .mux exists, we're done (already migrated or fresh install)
-  if (existsSync(newPath)) {
-    return;
-  }
-
-  // If .cmux exists, move it and create symlink for backward compatibility
-  if (existsSync(oldPath)) {
-    renameSync(oldPath, newPath);
-    symlinkSync(newPath, oldPath, "dir");
-  }
-
-  // If neither exists, nothing to do (will be created on first use)
-}
-
-const OBSOLETE_MUX_BIN_ARTIFACTS = ["agent-browser", "agent-browser.cmd"] as const;
+const OBSOLETE_SHUX_BIN_ARTIFACTS = ["agent-browser", "agent-browser.cmd"] as const;
 
 /**
- * Remove obsolete mux-managed bin wrappers that are no longer created at startup.
- * Keep this startup migration narrow so we don't delete unrelated user-managed files.
+ * Remove obsolete shux-managed bin wrappers that are no longer created at startup.
+ * Keep this startup cleanup narrow so we don't delete unrelated user-managed files.
  */
-export function cleanupObsoleteMuxBinArtifacts(rootDir?: string): void {
-  const binDir = join(rootDir ?? getMuxHome(), "bin");
+export function cleanupObsoleteShuxBinArtifacts(rootDir?: string): void {
+  const binDir = join(rootDir ?? getShuxHome(), "bin");
 
-  for (const artifactName of OBSOLETE_MUX_BIN_ARTIFACTS) {
+  for (const artifactName of OBSOLETE_SHUX_BIN_ARTIFACTS) {
     const artifactPath = join(binDir, artifactName);
 
     try {
@@ -87,79 +64,97 @@ export function cleanupObsoleteMuxBinArtifacts(rootDir?: string): void {
 }
 
 /**
- * Get the root directory for all mux configuration and data.
- * Can be overridden with MUX_ROOT environment variable.
- * Appends '-dev' suffix when NODE_ENV=development (explicit dev mode).
+ * Get the root directory for all shux configuration and data.
+ * SHUX_ROOT is canonical; MUX_ROOT remains a downgrade-compatible alias.
+ * Appends '-dev' when NODE_ENV=development.
  *
- * This is a getter function to support test mocking of os.homedir().
+ * Before startup migration completes, a lone legacy directory is returned as a
+ * non-destructive fallback. await initializeShuxHomeTransition() moves it to the canonical
+ * location and leaves the legacy path pointing forward.
  *
- * Note: This file is only used by main process code, but lives in constants/
- * for organizational purposes. The process.env access is safe.
+ * Main-process only: this helper lives in constants/ for organization, but it
+ * reads process.env / homedir and must not be imported from renderer code.
+ * The lint disable below is the documented renderer-boundary exception.
  */
-export function getMuxHome(): string {
-  // eslint-disable-next-line no-restricted-syntax, no-restricted-globals
-  if (process.env.MUX_ROOT) {
-    // eslint-disable-next-line no-restricted-syntax, no-restricted-globals
-    return process.env.MUX_ROOT;
+export function getShuxHome(): string {
+  // eslint-disable-next-line no-restricted-globals, no-restricted-syntax -- main-only home resolution; see file comment
+  const explicitRoot = resolveShuxEnvironmentValue("ROOT", process.env);
+  if (explicitRoot) {
+    return explicitRoot;
   }
 
-  const baseName = MUX_DIR_NAME;
-  // Use -dev suffix only when explicitly in development mode
-  // eslint-disable-next-line no-restricted-syntax, no-restricted-globals
+  // eslint-disable-next-line no-restricted-globals, no-restricted-syntax -- main-only NODE_ENV suffix; see file comment
   const suffix = process.env.NODE_ENV === "development" ? "-dev" : "";
-  return join(homedir(), baseName + suffix);
+  const canonicalPath = join(homedir(), SHUX_HOME_DIR_NAME + suffix);
+  if (existsSync(canonicalPath)) {
+    return canonicalPath;
+  }
+
+  const legacyMuxPath = join(homedir(), LEGACY_MUX_HOME_DIR_NAME + suffix);
+  if (existsSync(legacyMuxPath)) {
+    return legacyMuxPath;
+  }
+
+  if (!suffix) {
+    const legacyCmuxPath = join(homedir(), LEGACY_CMUX_HOME_DIR_NAME);
+    if (existsSync(legacyCmuxPath)) {
+      return legacyCmuxPath;
+    }
+  }
+
+  return canonicalPath;
 }
 
 /**
  * Get the directory where workspace git worktrees are stored.
- * Example: ~/.mux/src/my-project/feature-branch
+ * Example: ~/.shux/src/my-project/feature-branch
  *
- * @param rootDir - Optional root directory (defaults to getMuxHome())
+ * @param rootDir - Optional root directory (defaults to getShuxHome())
  */
-export function getMuxSrcDir(rootDir?: string): string {
-  const root = rootDir ?? getMuxHome();
+export function getShuxSrcDir(rootDir?: string): string {
+  const root = rootDir ?? getShuxHome();
   return join(root, "src");
 }
 
 /**
  * Get the directory where session chat histories are stored.
- * Example: ~/.mux/sessions/workspace-id/chat.jsonl
+ * Example: ~/.shux/sessions/workspace-id/chat.jsonl
  *
- * @param rootDir - Optional root directory (defaults to getMuxHome())
+ * @param rootDir - Optional root directory (defaults to getShuxHome())
  */
-export function getMuxSessionsDir(rootDir?: string): string {
-  const root = rootDir ?? getMuxHome();
+export function getShuxSessionsDir(rootDir?: string): string {
+  const root = rootDir ?? getShuxHome();
   return join(root, "sessions");
 }
 
 /**
  * Get the directory where mux backend logs are stored.
- * Example: ~/.mux/logs/mux.log
+ * Example: ~/.shux/logs/mux.log
  *
- * @param rootDir - Optional root directory (defaults to getMuxHome())
+ * @param rootDir - Optional root directory (defaults to getShuxHome())
  */
-export function getMuxLogsDir(rootDir?: string): string {
-  const root = rootDir ?? getMuxHome();
+export function getShuxLogsDir(rootDir?: string): string {
+  const root = rootDir ?? getShuxHome();
   return join(root, "logs");
 }
 
 /**
  * Get the default directory for new projects created with bare names.
- * Example: ~/.mux/projects/my-project
+ * Example: ~/.shux/projects/my-project
  *
- * @param rootDir - Optional root directory (defaults to getMuxHome())
+ * @param rootDir - Optional root directory (defaults to getShuxHome())
  */
-export function getMuxProjectsDir(rootDir?: string): string {
-  const root = rootDir ?? getMuxHome();
+export function getShuxProjectsDir(rootDir?: string): string {
+  const root = rootDir ?? getShuxHome();
   return join(root, "projects");
 }
 
 /**
  * Get the extension metadata file path (shared with VS Code extension).
  *
- * @param rootDir - Optional root directory (defaults to getMuxHome())
+ * @param rootDir - Optional root directory (defaults to getShuxHome())
  */
-export function getMuxExtensionMetadataPath(rootDir?: string): string {
-  const root = rootDir ?? getMuxHome();
+export function getShuxExtensionMetadataPath(rootDir?: string): string {
+  const root = rootDir ?? getShuxHome();
   return join(root, "extensionMetadata.json");
 }
