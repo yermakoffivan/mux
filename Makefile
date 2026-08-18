@@ -471,10 +471,11 @@ dist-mac-arm64: build ## Build macOS arm64 distributable only
 	@bun x electron-builder --mac --arm64 --publish never
 
 install-mac-arm64: dist-mac-arm64 ## Build and install macOS arm64 app to /Applications
-	@echo "Installing shux.app to /Applications..."
-	@rm -rf /Applications/shux.app
-	@cp -R release/mac-arm64/shux.app /Applications/
-	@echo "Installed shux.app to /Applications"
+	@app_bundle="$$(bun -e 'import { resolveMacPackagedAppNames } from "./src/common/compat/macPackagedApp.ts"; import pkg from "./package.json"; process.stdout.write(resolveMacPackagedAppNames(pkg.build).appBundleName)')"; \
+	echo "Installing $$app_bundle to /Applications..."; \
+	rm -rf "/Applications/$$app_bundle"; \
+	cp -R "release/mac-arm64/$$app_bundle" /Applications/; \
+	echo "Installed $$app_bundle to /Applications"
 
 dist-win: build ## Build Windows distributable
 	@bun x electron-builder --win --publish never

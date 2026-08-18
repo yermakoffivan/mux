@@ -298,8 +298,8 @@ describe("Loaded skills tracking", () => {
     const skills = aggregator.getLoadedSkills();
     expect(skills).toHaveLength(3);
     expect(skills.map((skill) => skill.name).sort()).toEqual([
-      "shux-docs",
       "pull-requests",
+      "shux-docs",
       "tests",
     ]);
   });

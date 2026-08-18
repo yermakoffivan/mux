@@ -6857,7 +6857,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "The supported flow is sequential: close one version before launching or installing the other. Running old Mux and new Shux processes concurrently against the same sessions is not supported.",
       "",
-      "A manual macOS DMG downgrade may replace or coexist with `shux.app` as `Mux.app`, depending on where the user drags the bundle. The shared data links preserve state, but Shux cannot create a system-wide `/Applications/Mux.app` alias without installation privileges. Windows and Linux installers likewise preserve data even when shortcut or executable filenames change.",
+      "A manual macOS DMG downgrade may replace or coexist with `shux.app` as `Mux.app`, depending on where the user drags the bundle. The packaged directory is `shux.app` even though the display name is Shux. The shared data links preserve state, but Shux cannot create a system-wide `/Applications/Mux.app` alias without installation privileges. Windows and Linux installers likewise preserve data even when shortcut or executable filenames change.",
       "",
       "## Compatibility names that intentionally remain",
       "",

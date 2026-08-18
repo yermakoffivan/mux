@@ -1,7 +1,23 @@
 import { describe, expect, test } from "bun:test";
+import { AppInfo as ElectronBuilderAppInfo } from "app-builder-lib/out/appInfo";
 import packageJson from "../../../package.json";
 import legacyPackageJson from "../../../packages/mux-compat/package.json";
 import vscodePackageJson from "../../../vscode/package.json";
+import { resolveMacPackagedAppNames } from "./macPackagedApp";
+
+interface PackagedAppInfo {
+  productFilename: string;
+  productName: string;
+}
+
+// Runtime AppInfo only needs metadata+config; the published types require Packager.
+const AppInfo = ElectronBuilderAppInfo as unknown as new (
+  info: {
+    metadata: { name: string; version: string; description?: string };
+    config: { productName?: string; executableName?: string | null };
+  },
+  buildVersion: null
+) => PackagedAppInfo;
 
 const LOWERCASE_ARTIFACT_TEMPLATE = "${name}-${version}-${arch}.${ext}";
 
@@ -26,6 +42,43 @@ describe("shux package transition contract", () => {
     expect(packageJson.build.productName).toBe("Shux");
     expect(packageJson.build.executableName).toBe(packageJson.name);
     expect(packageJson.build.protocols[0]?.schemes).toEqual(["shux", "mux"]);
+  });
+
+  test("names the macOS bundle from executableName via electron-builder productFilename", () => {
+    const names = resolveMacPackagedAppNames(packageJson.build);
+    const appInfo = new AppInfo(
+      {
+        metadata: {
+          name: packageJson.name,
+          version: packageJson.version,
+          description: packageJson.description,
+        },
+        config: packageJson.build,
+      },
+      null
+    );
+
+    expect(names.productFilename).toBe(packageJson.build.executableName);
+    expect(names.appBundleName).toBe(`${packageJson.build.executableName}.app`);
+    expect(names.productFilename).not.toBe(packageJson.build.productName);
+    expect(appInfo.productFilename).toBe(names.productFilename);
+    expect(appInfo.productName).toBe(packageJson.build.productName);
+
+    const withoutExecutableName = new AppInfo(
+      {
+        metadata: {
+          name: packageJson.name,
+          version: packageJson.version,
+          description: packageJson.description,
+        },
+        config: { productName: packageJson.build.productName },
+      },
+      null
+    );
+    expect(withoutExecutableName.productFilename).toBe(packageJson.build.productName);
+    expect(
+      resolveMacPackagedAppNames({ productName: packageJson.build.productName }).productFilename
+    ).toBe(withoutExecutableName.productFilename);
   });
 
   test("publishes lowercase slug artifacts instead of productName filenames", () => {
