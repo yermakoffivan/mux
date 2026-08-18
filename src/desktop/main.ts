@@ -73,6 +73,14 @@ if (electronAppIdentity.chromeDesktop != null) {
   process.env.CHROME_DESKTOP = electronAppIdentity.chromeDesktop;
 }
 
+async function isUsableDirectory(candidatePath: string): Promise<boolean> {
+  try {
+    return (await fsPromises.stat(candidatePath)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Home and userData transitions must finish before crashReporter, the single-instance
  * lock, services, or windows. Electron is already imported (CJS hoists requires), but
@@ -110,15 +118,30 @@ async function initializeShuxDesktopStorage(): Promise<void> {
       appDataDir,
       platform: process.platform,
     });
-    app.setPath("userData", transition.activePath);
+    if (await isUsableDirectory(transition.activePath)) {
+      app.setPath("userData", transition.activePath);
+    } else {
+      console.debug(
+        "[shux-transition] Refusing to set userData to a non-directory:",
+        transition.activePath
+      );
+    }
     for (const issue of transition.issues) {
       console.debug("[shux-transition]", issue);
     }
   } catch (error) {
     // Never fall back to Electron's name-derived userData: display-cased setName("Shux")
     // would otherwise create a parallel Shux/ directory beside the canonical shux/ slug.
+    // Also never point userData at an obstructing file or broken alias.
     console.debug("[shux-transition] Failed Electron userData transition:", error);
-    app.setPath("userData", canonicalUserData);
+    if (await isUsableDirectory(canonicalUserData)) {
+      app.setPath("userData", canonicalUserData);
+    } else {
+      console.debug(
+        "[shux-transition] Refusing to set userData to a non-directory:",
+        canonicalUserData
+      );
+    }
   }
 }
 

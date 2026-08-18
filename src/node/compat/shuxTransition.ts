@@ -114,7 +114,7 @@ async function findFirstHealthyDirectory(paths: string[]): Promise<string | unde
 }
 
 function recordUnusableCanonical(canonicalPath: string, issues: string[]): void {
-  const issue = `${canonicalPath} exists but is not a usable directory; left it unchanged`;
+  const issue = `${canonicalPath} exists but is not a usable directory`;
   if (!issues.includes(issue)) {
     issues.push(issue);
   }
@@ -139,13 +139,105 @@ async function resolveLegacyFallbackPath(
     }
     try {
       await fs.mkdir(fallbackPath, { recursive: true });
-      return fallbackPath;
     } catch (error) {
       issues.push(`Could not create fallback ${fallbackPath}: ${String(error)}`);
+      continue;
     }
+    if (await isHealthyDirectory(fallbackPath)) {
+      return fallbackPath;
+    }
+    issues.push(`Created fallback ${fallbackPath} but it is still not a usable directory`);
   }
 
   return undefined;
+}
+
+async function nextUnusedSiblingPath(path: string, label: string): Promise<string> {
+  const stamp = Date.now();
+  let suffix = 0;
+  while (true) {
+    const candidate =
+      suffix === 0 ? `${path}.${label}-${stamp}` : `${path}.${label}-${stamp}-${suffix}`;
+    if (!(await pathEntryExists(candidate))) {
+      return candidate;
+    }
+    suffix += 1;
+  }
+}
+
+/**
+ * Move a file or broken alias aside without deleting it. Healthy directories
+ * are never touched. Returns true when `path` is missing or was moved aside.
+ */
+async function quarantineUnusableEntry(path: string, issues: string[]): Promise<boolean> {
+  if (!(await pathEntryExists(path))) {
+    return true;
+  }
+  if (await isHealthyDirectory(path)) {
+    return false;
+  }
+
+  const backupPath = await nextUnusedSiblingPath(path, "obstructed");
+  try {
+    await fs.rename(path, backupPath);
+    issues.push(`Moved unusable ${path} aside to ${backupPath} so a directory could be created`);
+    return true;
+  } catch (error) {
+    issues.push(`Could not move unusable ${path} aside: ${String(error)}`);
+    return false;
+  }
+}
+
+async function recoverDirectoryAt(path: string, issues: string[]): Promise<boolean> {
+  if (await isHealthyDirectory(path)) {
+    return true;
+  }
+  if (!(await quarantineUnusableEntry(path, issues))) {
+    return false;
+  }
+  try {
+    await fs.mkdir(path, { recursive: true });
+  } catch (error) {
+    issues.push(`Could not create ${path}: ${String(error)}`);
+    return false;
+  }
+  if (await isHealthyDirectory(path)) {
+    return true;
+  }
+  issues.push(`Created ${path} but it is still not a usable directory`);
+  return false;
+}
+
+/**
+ * Reclaim the standard canonical name when every leftover name is also a file
+ * or broken alias. Leftover obstructors are moved aside so downgrade aliases
+ * can be created. User entries are renamed, never deleted or overwritten.
+ */
+async function recoverObstructedCanonical(
+  canonicalPath: string,
+  legacyPaths: string[],
+  issues: string[]
+): Promise<boolean> {
+  if (!(await recoverDirectoryAt(canonicalPath, issues))) {
+    return false;
+  }
+  for (const legacyPath of legacyPaths) {
+    if (await isHealthyDirectory(legacyPath)) {
+      continue;
+    }
+    if (await pathEntryExists(legacyPath)) {
+      await quarantineUnusableEntry(legacyPath, issues);
+    }
+  }
+  return true;
+}
+
+async function requireHealthyDirectory(path: string, issues: string[]): Promise<string> {
+  if (await isHealthyDirectory(path)) {
+    return path;
+  }
+  const detail = issues.length > 0 ? `: ${issues.join("; ")}` : "";
+  throw new Error(`No usable shux directory is available at ${path}${detail}`);
 }
 
 /**
@@ -191,6 +283,68 @@ async function createDirectoryAlias(
   await fs.symlink(resolve(targetPath), aliasPath, platform === "win32" ? "junction" : "dir");
 }
 
+interface CompatibilityAliasOptions {
+  canonicalPath: string;
+  legacyPaths: string[];
+  platform: NodeJS.Platform;
+  issues: string[];
+  migratedFrom: string | undefined;
+  createdCanonical: boolean;
+}
+
+async function applyCompatibilityAliases(
+  options: CompatibilityAliasOptions
+): Promise<ShuxDirectoryTransitionResult | undefined> {
+  const canonicalUsableForAliases = await isHealthyDirectory(options.canonicalPath);
+
+  for (const legacyPath of options.legacyPaths) {
+    if (await pathEntryExists(legacyPath)) {
+      if (!(await sameExistingEntry(legacyPath, options.canonicalPath))) {
+        options.issues.push(
+          `Both ${legacyPath} and ${options.canonicalPath} exist independently; left both unchanged`
+        );
+      }
+      continue;
+    }
+
+    if (!canonicalUsableForAliases) {
+      // Compatibility aliases must point at a real directory, never a file.
+      continue;
+    }
+
+    try {
+      await createDirectoryAlias(options.canonicalPath, legacyPath, options.platform);
+    } catch (error) {
+      options.issues.push(`Could not create compatibility alias ${legacyPath}: ${String(error)}`);
+
+      // If this run just moved or created the canonical directory, roll it back to
+      // the primary legacy path rather than strand existing users without a path an
+      // older binary can open. A pre-existing canonical directory is never moved.
+      const primaryLegacyPath = options.legacyPaths[0];
+      if (
+        (options.migratedFrom != null || options.createdCanonical) &&
+        legacyPath === primaryLegacyPath
+      ) {
+        try {
+          await fs.rename(options.canonicalPath, primaryLegacyPath);
+          return {
+            canonicalPath: options.canonicalPath,
+            activePath: await requireHealthyDirectory(primaryLegacyPath, options.issues),
+            status: "legacy-fallback",
+            issues: options.issues,
+          };
+        } catch (rollbackError) {
+          options.issues.push(
+            `Could not roll back to ${primaryLegacyPath}: ${String(rollbackError)}`
+          );
+        }
+      }
+    }
+  }
+
+  return undefined;
+}
+
 /**
  * Move a legacy directory to its canonical shux path and leave old-name directory
  * aliases pointing forward. Older mux builds therefore keep reading and writing the
@@ -221,7 +375,7 @@ export async function ensureShuxDirectoryTransition(
         issues.push(`Could not move ${sourcePath} to ${canonicalPath}: ${String(error)}`);
         return {
           canonicalPath,
-          activePath: sourcePath,
+          activePath: await requireHealthyDirectory(sourcePath, issues),
           status: "legacy-fallback",
           issues,
         };
@@ -232,23 +386,37 @@ export async function ensureShuxDirectoryTransition(
         createdCanonical = true;
       } catch (error) {
         issues.push(`Could not create ${canonicalPath}: ${String(error)}`);
-        const fallbackPath = legacyPaths[0];
-        try {
-          await fs.mkdir(fallbackPath, { recursive: true });
-        } catch (fallbackError) {
-          issues.push(`Could not create fallback ${fallbackPath}: ${String(fallbackError)}`);
+        const fallbackPath = await resolveLegacyFallbackPath(legacyPaths, issues);
+        if (fallbackPath != null) {
+          return {
+            canonicalPath,
+            activePath: await requireHealthyDirectory(fallbackPath, issues),
+            status: "legacy-fallback",
+            issues,
+          };
         }
-        return {
-          canonicalPath,
-          activePath: fallbackPath,
-          status: "legacy-fallback",
-          issues,
-        };
+        if (await recoverObstructedCanonical(canonicalPath, legacyPaths, issues)) {
+          createdCanonical = true;
+        } else {
+          for (const leftoverPath of legacyPaths) {
+            if (await recoverDirectoryAt(leftoverPath, issues)) {
+              return {
+                canonicalPath,
+                activePath: await requireHealthyDirectory(leftoverPath, issues),
+                status: "legacy-fallback",
+                issues,
+              };
+            }
+          }
+          throw new Error(
+            `Could not create a usable directory at ${canonicalPath} or any leftover path: ${issues.join("; ")}`
+          );
+        }
       }
     }
   } else if (!(await isHealthyDirectory(canonicalPath))) {
-    // A regular file or broken symlink is not migratable storage. Leave it
-    // untouched so we never overwrite user data or treat a file as userData.
+    // A regular file or broken symlink is not migratable storage. Prefer a
+    // healthy leftover; only quarantine the obstruction when no usable path remains.
     recordUnusableCanonical(canonicalPath, issues);
   } else if (await isEmptyRealDirectory(canonicalPath)) {
     // An empty canonical dir plus one populated legacy tree is a leftover split
@@ -269,7 +437,7 @@ export async function ensureShuxDirectoryTransition(
             issues.push(`Could not restore ${canonicalPath}: ${String(restoreError)}`);
             return {
               canonicalPath,
-              activePath: sourcePath,
+              activePath: await requireHealthyDirectory(sourcePath, issues),
               status: "legacy-fallback",
               issues,
             };
@@ -279,79 +447,68 @@ export async function ensureShuxDirectoryTransition(
     }
   }
 
-  const canonicalUsableForAliases = await isHealthyDirectory(canonicalPath);
-
-  for (const legacyPath of legacyPaths) {
-    if (await pathEntryExists(legacyPath)) {
-      if (!(await sameExistingEntry(legacyPath, canonicalPath))) {
-        issues.push(
-          `Both ${legacyPath} and ${canonicalPath} exist independently; left both unchanged`
-        );
-      }
-      continue;
-    }
-
-    if (!canonicalUsableForAliases) {
-      // Compatibility aliases must point at a real directory, never a file.
-      continue;
-    }
-
-    try {
-      await createDirectoryAlias(canonicalPath, legacyPath, platform);
-    } catch (error) {
-      issues.push(`Could not create compatibility alias ${legacyPath}: ${String(error)}`);
-
-      // If this run just moved or created the canonical directory, roll it back to
-      // the primary legacy path rather than strand existing users without a path an
-      // older binary can open. A pre-existing canonical directory is never moved.
-      const primaryLegacyPath = legacyPaths[0];
-      if ((migratedFrom != null || createdCanonical) && legacyPath === primaryLegacyPath) {
-        try {
-          await fs.rename(canonicalPath, primaryLegacyPath);
-          return {
-            canonicalPath,
-            activePath: primaryLegacyPath,
-            status: "legacy-fallback",
-            issues,
-          };
-        } catch (rollbackError) {
-          issues.push(`Could not roll back to ${primaryLegacyPath}: ${String(rollbackError)}`);
-        }
-      }
+  if (await isHealthyDirectory(canonicalPath)) {
+    const aliasResult = await applyCompatibilityAliases({
+      canonicalPath,
+      legacyPaths,
+      platform,
+      issues,
+      migratedFrom,
+      createdCanonical,
+    });
+    if (aliasResult) {
+      return aliasResult;
     }
   }
 
   // conflict keeps a usable canonical tree active. If canonical is not a
-  // directory, prefer the first healthy legacy path instead of handing a file
-  // to Electron userData via activePath.
+  // directory, prefer the first healthy leftover, then reclaim the standard
+  // names by quarantining files/broken aliases. Never return a non-directory.
   if (!(await isHealthyDirectory(canonicalPath))) {
     recordUnusableCanonical(canonicalPath, issues);
     const fallbackPath = await resolveLegacyFallbackPath(legacyPaths, issues);
     if (fallbackPath != null) {
       return {
         canonicalPath,
-        activePath: fallbackPath,
+        activePath: await requireHealthyDirectory(fallbackPath, issues),
         status: "legacy-fallback",
         issues,
       };
     }
-    // Nothing usable or creatable remains. Still refuse to treat a file as a
-    // directory; callers get the first leftover name plus explicit issues.
-    const leftoverPath = legacyPaths[0];
-    if (leftoverPath != null) {
-      return {
+    if (await recoverObstructedCanonical(canonicalPath, legacyPaths, issues)) {
+      createdCanonical = true;
+      const recoveredAliasResult = await applyCompatibilityAliases({
         canonicalPath,
-        activePath: leftoverPath,
-        status: "legacy-fallback",
+        legacyPaths,
+        platform,
         issues,
-      };
+        migratedFrom,
+        createdCanonical,
+      });
+      if (recoveredAliasResult) {
+        return recoveredAliasResult;
+      }
+    } else {
+      for (const leftoverPath of legacyPaths) {
+        if (await recoverDirectoryAt(leftoverPath, issues)) {
+          return {
+            canonicalPath,
+            activePath: await requireHealthyDirectory(leftoverPath, issues),
+            status: "legacy-fallback",
+            issues,
+          };
+        }
+      }
+      throw new Error(
+        `Could not create a usable directory at ${canonicalPath} or any leftover path: ${issues.join("; ")}`
+      );
     }
   }
 
   const hasConflict = issues.some((issue) => issue.includes("exist independently"));
   return {
     canonicalPath,
-    activePath: canonicalPath,
+    activePath: await requireHealthyDirectory(canonicalPath, issues),
     status: hasConflict ? "conflict" : migratedFrom ? "migrated" : "canonical",
     issues,
   };

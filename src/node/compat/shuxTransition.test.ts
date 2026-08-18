@@ -73,6 +73,14 @@ async function expectMissingPath(path: string): Promise<void> {
   throw new Error(`expected ${path} to be missing`);
 }
 
+async function listQuarantineBackups(dir: string, baseName: string): Promise<string[]> {
+  const names = await fs.readdir(dir);
+  return names
+    .filter((name) => name.startsWith(`${baseName}.obstructed-`))
+    .map((name) => join(dir, name))
+    .sort();
+}
+
 afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
 });
@@ -296,6 +304,95 @@ describe("initializeShuxHomeTransition", () => {
     });
   });
 
+  test("quarantines obstructing files and recovers a persistent canonical home", async () => {
+    const homeDir = await createTempDir();
+    const canonicalPath = join(homeDir, ".shux");
+    const muxPath = join(homeDir, ".mux");
+    const cmuxPath = join(homeDir, ".cmux");
+    await fs.writeFile(canonicalPath, "canonical-bytes", "utf8");
+    await fs.writeFile(muxPath, "mux-bytes", "utf8");
+    await fs.writeFile(cmuxPath, "cmux-bytes", "utf8");
+
+    const first = await initializeShuxHomeTransition({ homeDir, env: {}, platform: "linux" });
+
+    expect(first.status).toBe("canonical");
+    expect(first.activePath).toBe(canonicalPath);
+    expect((await fs.stat(first.activePath)).isDirectory()).toBe(true);
+    expect(
+      first.issues.some(
+        (issue) => issue.includes("Moved unusable") && issue.includes(canonicalPath)
+      )
+    ).toBe(true);
+    expect(await fs.realpath(muxPath)).toBe(await fs.realpath(canonicalPath));
+    expect(await fs.realpath(cmuxPath)).toBe(await fs.realpath(canonicalPath));
+
+    const canonicalBackups = await listQuarantineBackups(homeDir, ".shux");
+    const muxBackups = await listQuarantineBackups(homeDir, ".mux");
+    const cmuxBackups = await listQuarantineBackups(homeDir, ".cmux");
+    expect(canonicalBackups).toHaveLength(1);
+    expect(muxBackups).toHaveLength(1);
+    expect(cmuxBackups).toHaveLength(1);
+    expect(await fs.readFile(canonicalBackups[0], "utf8")).toBe("canonical-bytes");
+    expect(await fs.readFile(muxBackups[0], "utf8")).toBe("mux-bytes");
+    expect(await fs.readFile(cmuxBackups[0], "utf8")).toBe("cmux-bytes");
+    withHomeDir(homeDir, () => {
+      expect(getShuxHome()).toBe(canonicalPath);
+    });
+
+    const second = await initializeShuxHomeTransition({ homeDir, env: {}, platform: "linux" });
+    expect(second.activePath).toBe(first.activePath);
+    expect((await fs.stat(second.activePath)).isDirectory()).toBe(true);
+    expect(await listQuarantineBackups(homeDir, ".shux")).toEqual(canonicalBackups);
+    expect(await fs.readFile(canonicalBackups[0], "utf8")).toBe("canonical-bytes");
+    expect(await fs.readFile(muxBackups[0], "utf8")).toBe("mux-bytes");
+    expect(await fs.readFile(cmuxBackups[0], "utf8")).toBe("cmux-bytes");
+    withHomeDir(homeDir, () => {
+      expect(getShuxHome()).toBe(first.activePath);
+    });
+  });
+
+  test("quarantines broken aliases and recovers a persistent canonical home", async () => {
+    const homeDir = await createTempDir();
+    const canonicalPath = join(homeDir, ".shux");
+    const muxPath = join(homeDir, ".mux");
+    const cmuxPath = join(homeDir, ".cmux");
+    const missingCanonical = join(homeDir, "missing-canonical");
+    const missingMux = join(homeDir, "missing-mux");
+    const missingCmux = join(homeDir, "missing-cmux");
+    await fs.symlink(missingCanonical, canonicalPath);
+    await fs.symlink(missingMux, muxPath);
+    await fs.symlink(missingCmux, cmuxPath);
+
+    const first = await initializeShuxHomeTransition({ homeDir, env: {}, platform: "linux" });
+
+    expect(first.status).toBe("canonical");
+    expect(first.activePath).toBe(canonicalPath);
+    expect((await fs.stat(first.activePath)).isDirectory()).toBe(true);
+    expect(await fs.realpath(muxPath)).toBe(await fs.realpath(canonicalPath));
+    expect(await fs.realpath(cmuxPath)).toBe(await fs.realpath(canonicalPath));
+
+    const canonicalBackups = await listQuarantineBackups(homeDir, ".shux");
+    const muxBackups = await listQuarantineBackups(homeDir, ".mux");
+    const cmuxBackups = await listQuarantineBackups(homeDir, ".cmux");
+    expect(canonicalBackups).toHaveLength(1);
+    expect((await fs.lstat(canonicalBackups[0])).isSymbolicLink()).toBe(true);
+    expect(await fs.readlink(canonicalBackups[0])).toBe(missingCanonical);
+    expect(await fs.readlink(muxBackups[0])).toBe(missingMux);
+    expect(await fs.readlink(cmuxBackups[0])).toBe(missingCmux);
+    withHomeDir(homeDir, () => {
+      expect(getShuxHome()).toBe(canonicalPath);
+    });
+
+    const second = await initializeShuxHomeTransition({ homeDir, env: {}, platform: "linux" });
+    expect(second.activePath).toBe(first.activePath);
+    expect((await fs.stat(second.activePath)).isDirectory()).toBe(true);
+    expect(await listQuarantineBackups(homeDir, ".shux")).toEqual(canonicalBackups);
+    expect(await fs.readlink(canonicalBackups[0])).toBe(missingCanonical);
+    withHomeDir(homeDir, () => {
+      expect(getShuxHome()).toBe(first.activePath);
+    });
+  });
+
   test("does not activate an unhealthy canonical path when no healthy legacy tree exists", async () => {
     const homeDir = await createTempDir();
     const canonicalPath = join(homeDir, ".shux");
@@ -411,6 +508,74 @@ describe("initializeShuxUserDataTransition", () => {
     expect(await fs.readFile(join(productNamePath, "from-Mux"), "utf8")).toBe("older");
     expect((await fs.lstat(muxPath)).isDirectory()).toBe(true);
     expect((await fs.lstat(productNamePath)).isDirectory()).toBe(true);
+  });
+
+  test("quarantines obstructing userData files and recovers a persistent canonical directory", async () => {
+    const appDataDir = await createTempDir();
+    const canonicalPath = join(appDataDir, "shux");
+    const muxPath = join(appDataDir, "mux");
+    const productNamePath = join(appDataDir, "Mux");
+    await fs.writeFile(canonicalPath, "canonical-bytes", "utf8");
+    await fs.writeFile(muxPath, "mux-bytes", "utf8");
+    await fs.writeFile(productNamePath, "Mux-bytes", "utf8");
+
+    const first = await initializeShuxUserDataTransition({ appDataDir, platform: "linux" });
+
+    expect(first.status).toBe("canonical");
+    expect(first.activePath).toBe(canonicalPath);
+    expect((await fs.stat(first.activePath)).isDirectory()).toBe(true);
+    expect(await fs.realpath(muxPath)).toBe(await fs.realpath(canonicalPath));
+    expect(await fs.realpath(productNamePath)).toBe(await fs.realpath(canonicalPath));
+    expect(await fs.readFile((await listQuarantineBackups(appDataDir, "shux"))[0], "utf8")).toBe(
+      "canonical-bytes"
+    );
+    expect(await fs.readFile((await listQuarantineBackups(appDataDir, "mux"))[0], "utf8")).toBe(
+      "mux-bytes"
+    );
+    expect(await fs.readFile((await listQuarantineBackups(appDataDir, "Mux"))[0], "utf8")).toBe(
+      "Mux-bytes"
+    );
+
+    const second = await initializeShuxUserDataTransition({ appDataDir, platform: "linux" });
+    expect(second.activePath).toBe(first.activePath);
+    expect((await fs.stat(second.activePath)).isDirectory()).toBe(true);
+    expect(await fs.readFile((await listQuarantineBackups(appDataDir, "shux"))[0], "utf8")).toBe(
+      "canonical-bytes"
+    );
+  });
+
+  test("quarantines broken userData aliases and recovers a persistent canonical directory", async () => {
+    const appDataDir = await createTempDir();
+    const canonicalPath = join(appDataDir, "shux");
+    const muxPath = join(appDataDir, "mux");
+    const productNamePath = join(appDataDir, "Mux");
+    const missingCanonical = join(appDataDir, "missing-canonical");
+    const missingMux = join(appDataDir, "missing-mux");
+    const missingMuxName = join(appDataDir, "missing-Mux");
+    await fs.symlink(missingCanonical, canonicalPath);
+    await fs.symlink(missingMux, muxPath);
+    await fs.symlink(missingMuxName, productNamePath);
+
+    const first = await initializeShuxUserDataTransition({ appDataDir, platform: "linux" });
+
+    expect(first.status).toBe("canonical");
+    expect(first.activePath).toBe(canonicalPath);
+    expect((await fs.stat(first.activePath)).isDirectory()).toBe(true);
+    expect(await fs.realpath(muxPath)).toBe(await fs.realpath(canonicalPath));
+    expect(await fs.readlink((await listQuarantineBackups(appDataDir, "shux"))[0])).toBe(
+      missingCanonical
+    );
+    expect(await fs.readlink((await listQuarantineBackups(appDataDir, "mux"))[0])).toBe(missingMux);
+    expect(await fs.readlink((await listQuarantineBackups(appDataDir, "Mux"))[0])).toBe(
+      missingMuxName
+    );
+
+    const second = await initializeShuxUserDataTransition({ appDataDir, platform: "linux" });
+    expect(second.activePath).toBe(first.activePath);
+    expect((await fs.stat(second.activePath)).isDirectory()).toBe(true);
+    expect(await fs.readlink((await listQuarantineBackups(appDataDir, "shux"))[0])).toBe(
+      missingCanonical
+    );
   });
 
   test("prefers a healthy mux userData tree when the canonical entry is a regular file", async () => {
